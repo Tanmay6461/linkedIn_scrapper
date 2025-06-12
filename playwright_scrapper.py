@@ -1261,7 +1261,6 @@ class PlaywrightProfileScraper:
             logger.error(f"A critical error occurred in scrape_user_activity: {e}")
             return activity_data, new_times
 
-
     async def _extract_posts(self, since_timestamp=None, max_posts=None):
         """
         High-performance extractor for the 'Posts' tab.
