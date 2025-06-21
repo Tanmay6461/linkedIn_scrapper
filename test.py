@@ -76,7 +76,7 @@ def extract_social_activity_by_profile(act, current_company):
     """
     activity_map = {}
     # Collect by "other profile" (the person whose content was engaged)
-    def add_activity(target_url, target_name, post_text, comment,source, timestamp=None ):
+    def add_activity(target_url, target_name, post_text, comment,source, engagement=None, timestamp=None ):
         if not target_url:
             return
         # Normalize
@@ -89,7 +89,8 @@ def extract_social_activity_by_profile(act, current_company):
             "post_text": post_text,
             "comment": comment,
             "timestamp": timestamp,
-            "source": [source]
+            "source": [source],
+            "engagement": engagement 
         }
         # Deduplication/merging: merge sources if same text+comment+url
         if target_url not in activity_map:
@@ -118,7 +119,8 @@ def extract_social_activity_by_profile(act, current_company):
             post_text=post_text,
             comment="",
             timestamp=post.get("timestamp"),
-            source="post"
+            source="post",
+            engagement=post.get("engagement")
         )
 
     # COMMENTS
@@ -157,7 +159,7 @@ def extract_social_activity_by_profile(act, current_company):
             target_name=reaction.get("post_owner_name"),
             post_text=post_text,
             comment="",
-            # timestamp=reaction.get("timestamp"),
+            timestamp=reaction.get("timestamp"),
             source="reaction"
         )
 
@@ -180,8 +182,9 @@ def merge_social_activities(activity_list):
                 "post_text": act["post_text"],
                 "actions": [{
                     "source": [],
-                    "timestamp": None,
-                    "comment": None
+                    "post_timestamp": act.get("timestamp"),
+                    "comment": None,
+                    "engagement": act.get("engagement", {})
                 }]
             }
         # Always use the same action slot
@@ -193,9 +196,13 @@ def merge_social_activities(activity_list):
         # Always prefer timestamp and comment if present from "comment" type
         if "comment" in action["source"]:
             if act.get("timestamp"):
-                action["timestamp"] = act.get("timestamp")
+                action["comment_timestamp"] = act.get("timestamp")
             if act.get("comment"):
                 action["comment"] = act.get("comment")
+                
+
+        if act.get("engagement"):
+            action["engagement"] = act["engagement"]
     # Clean up actions: remove 'comment' and 'timestamp' if not set
     for item in grouped.values():
         for action in item["actions"]:
@@ -203,6 +210,8 @@ def merge_social_activities(activity_list):
                 action.pop("comment", None)
             if not action.get("timestamp"):
                 action.pop("timestamp", None)
+            if not action.get("engagement"):
+                action.pop("engagement", None)
     return list(grouped.values())
 
 def contains_company_name(text, company_name):

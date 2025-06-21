@@ -18,6 +18,7 @@ import sys
 import re
 from bs4 import BeautifulSoup
 import traceback
+from file_watcher import ProfileFileWatcher
 
 # Set up logging
 logging.basicConfig(
@@ -31,6 +32,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 STATE_FILE = "linkedin_state.json"
+logging.getLogger().setLevel(logging.DEBUG)
 
 def load_state() -> dict:
         if os.path.exists(STATE_FILE):
@@ -41,7 +43,6 @@ def load_state() -> dict:
 def save_state(state: dict):
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
-
 
 def parse_linkedin_timestamp(ts):
     if not ts:
@@ -63,7 +64,6 @@ def parse_linkedin_timestamp(ts):
             return datetime.now() - timedelta(days=num * 365)
     # If all fails
     return None
-
 
 class PlaywrightProfileScraper:
     """LinkedIn profile scraper using Playwright"""
@@ -124,13 +124,32 @@ class PlaywrightProfileScraper:
 
     async def load_cookies(self, context, path):
         try:
-            if os.path.exists(path):
+            if os.path.exists(path) and os.path.getsize(path) > 0:
                 with open(path, "r") as f:
                     cookies = json.load(f)
-                await context.add_cookies(cookies)
-                logger.info(f"Worker {self.worker_id}: Cookies loaded from {path}")
-        except Exception as e:
+                if cookies:  # Only load if cookies exist
+                    await context.add_cookies(cookies)
+                    logger.info(f"Worker {self.worker_id}: Cookies loaded from {path}")
+                    return True
+        except (json.JSONDecodeError, FileNotFoundError) as e:
             logger.warning(f"Worker {self.worker_id}: Could not load cookies: {e}")
+        return False
+
+    def test_proxy(self, proxy_url):
+        """Test if a proxy is working"""
+        import requests
+        try:
+            proxies = {
+                'http': proxy_url,
+                'https': proxy_url
+            }
+            response = requests.get('https://httpbin.org/ip', proxies=proxies, timeout=10)
+            if response.status_code == 200:
+                logger.info(f"Proxy {proxy_url} is working")
+                return True
+        except Exception as e:
+            logger.warning(f"Proxy {proxy_url} failed test: {e}")
+        return False
 
     async def initialize(self):
         """Initialize Playwright browser, context, and optionally restore session via cookies."""
@@ -139,9 +158,31 @@ class PlaywrightProfileScraper:
             self.playwright = await async_playwright().start()
 
             # Browser launch args
-            browser_args = []
+            browser_args = [
+                '--no-sandbox',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-web-security',
+                '--disable-features=VizDisplayCompositor'
+            ]
+
+            proxy_config = None
             if self.proxy:
-                browser_args.append(f'--proxy-server={self.proxy}')
+                logger.info(f"Worker {self.worker_id}: Testing proxy {self.proxy}")
+                if self.test_proxy(self.proxy):
+                    # Configure proxy for Playwright
+                    if self.proxy.startswith('http://') or self.proxy.startswith('https://'):
+                        proxy_parts = self.proxy.replace('http://', '').replace('https://', '').split(':')
+                        if len(proxy_parts) >= 2:
+                            proxy_config = {
+                                'server': f"http://{proxy_parts[0]}:{proxy_parts[1]}"
+                            }
+                            # Add authentication if provided
+                            if len(proxy_parts) >= 4:
+                                proxy_config['username'] = proxy_parts[2]
+                                proxy_config['password'] = proxy_parts[3]
+                else:
+                    logger.warning(f"Worker {self.worker_id}: Proxy failed test, proceeding without proxy")
+                    self.proxy = None
 
             self.browser = await self.playwright.chromium.launch(
                 headless=self.headless,
@@ -160,12 +201,11 @@ class PlaywrightProfileScraper:
                 {'width': 1680, 'height': 1050},
                 {'width': 1920, 'height': 1080}
             ])
-            user_agent = random.choice([
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-                "(KHTML, like Gecko) Version/16.3 Safari/605.1.15",
-            ])
+
+            with open("userAgents.json", "r") as ua:
+                user_agents = json.load(ua)
+
+            user_agent = random.choice(user_agents)
 
             # Create context
             self.context = await self.browser.new_context(
@@ -196,44 +236,43 @@ class PlaywrightProfileScraper:
 
             self.page.set_default_timeout(30000)
             self.page.on("console", lambda msg: logger.debug(f"Browser console: {msg.text}"))
+            self._check_cooldown_state()
 
-            # --- Attempt to load cookies ---
+            if self.in_cooldown:
+                logger.info(f"Worker {self.worker_id}: In cooldown until {self.cooldown_until}")
+                return True
+
+            # --- Attempt to load cookies BEFORE any navigation ---
             cookie_path = f"cookies_worker_{self.worker_id}.json"
-            cookies_loaded = False
-            if os.path.exists(cookie_path):
-                try:
-                    await self.load_cookies(self.context, cookie_path)
-                    cookies_loaded = True
-                    logger.info(f"Worker {self.worker_id}: Loaded cookies from {cookie_path}")
-                except Exception as e:
-                    logger.warning(f"Worker {self.worker_id}: Failed to load cookies: {e}")
+            cookies_loaded = await self.load_cookies(self.context, cookie_path)
 
             self.session_start_time = datetime.now()
             self.profiles_scraped = 0
 
-            # --- If cookies were loaded, verify by hitting /feed/ ---
-            if cookies_loaded:
-                try:
-                    await self.page.goto("https://www.linkedin.com/feed/", wait_until="networkidle")
-                except Exception as nav_ex:
-                    logger.error(f"Worker {self.worker_id}: Couldn't reach feed page: {nav_ex}")
-                    await self.cleanup()
-                    return False
+            # Always go to /feed and check login status
+            try:
+                await self.page.goto("https://www.linkedin.com/feed/", wait_until="networkidle")
+            except Exception as nav_ex:
+                logger.error(f"Worker {self.worker_id}: Couldn't reach feed page: {nav_ex}")
+                await self.cleanup()
+                return False
 
-                # If we're on feed and not blocked by auth-wall, we're logged in
-                if "feed" in self.page.url and not await self._is_authwall_present():
-                    self.is_logged_in = True
-                    logger.info(f"Worker {self.worker_id}: Session restored via cookies.")
-                    return True
-                else:
-                    logger.info(f"Worker {self.worker_id}: Cookie session invalid or authwall present.")
-                    self.is_logged_in = False
-
+            # Robust login/authwall check
+            if cookies_loaded and "feed" in self.page.url and not await self._is_authwall_present():
+                self.is_logged_in = True
+                logger.info(f"Worker {self.worker_id}: Session restored via cookies.")
             else:
-                logger.info(f"Worker {self.worker_id}: No cookie file; will perform fresh login.")
+                self.is_logged_in = False
+                logger.info(f"Worker {self.worker_id}: Not logged in, will perform fresh login.")
 
-            # Either no cookies, or they didn’t work → return True so login() will run later
-            return True
+            self.last_activity_time = datetime.now()
+            self._check_cooldown_state()
+
+            # Only start activity simulation if logged in and not in cooldown
+            if not self.in_cooldown and self.is_logged_in:
+                await self.start_activity_simulation()
+
+            return True  # So login() will run if not authenticated
 
         except Exception as e:
             logger.error(f"Worker {self.worker_id}: Error initializing browser: {e}")
@@ -293,7 +332,7 @@ class PlaywrightProfileScraper:
                         model: '',
                         platform: 'Windows',
                         platformVersion: '10.0',
-                        uaFullVersion: '115.0.5790.110'
+                        uaFullVersion: '120.0.6099.109'
                     })
                 });
             }
@@ -318,8 +357,136 @@ class PlaywrightProfileScraper:
             }
         }
         """)
-    
+
+    async def start_activity_simulation(self):
+        """Start a background task to keep the session alive with random activity"""
+        task = asyncio.create_task(self._activity_simulation_loop())
+        task.set_name(f"activity_simulation_{self.worker_id}")
+
+    async def _activity_simulation_loop(self):
+        """Loop that performs random human-like actions to keep the session alive"""
+        logger.info(f"Worker {self.worker_id}: Started activity simulation loop")
+        
+        while self.is_logged_in and not self.in_cooldown:
+            # Wait for a random interval (5-15 minutes between activities)
+            await asyncio.sleep(random.uniform(300, 900))
+            
+            if not self.is_logged_in or self.in_cooldown:
+                break
+                
+            try:
+                logger.info(f"Worker {self.worker_id}: Performing random activity to keep session alive")
+                
+                # Select a random activity
+                activities = [
+                    self._check_feed_activity,
+                    self._check_notifications_activity,
+                    self._check_my_network_activity,
+                    self._check_messaging_activity,
+                    self._visit_own_profile_activity
+                ]
+                
+                # Perform 1-2 random activities
+                for _ in range(random.randint(1, 2)):
+                    activity = random.choice(activities)
+                    await activity()
+                    await self._human_sleep(2, 5)
+                    
+            except Exception as e:
+                logger.error(f"Worker {self.worker_id}: Error in activity simulation: {e}")
+
+    async def _check_feed_activity(self):
+        """Check feed and scroll through it"""
+        try:
+            await self.page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded")
+            await self._human_sleep(2, 4)
+            
+            # Scroll feed 2-5 times
+            scroll_count = random.randint(2, 5)
+            for _ in range(scroll_count):
+                scroll_amount = random.randint(300, 800)
+                await self.page.evaluate(f"window.scrollBy(0, {scroll_amount});")
+                await self._human_sleep(1, 3)
+                
+            logger.debug(f"Worker {self.worker_id}: Performed feed activity")
+        except Exception as e:
+            logger.warning(f"Worker {self.worker_id}: Feed activity failed: {e}")
+
+    async def _check_notifications_activity(self):
+        """Check notifications"""
+        try:
+            # Click notifications icon
+            await self.page.click("a[data-test-global-nav-link='notifications']")
+            await self._human_sleep(2, 4)
+            
+            # Scroll through notifications
+            scroll_count = random.randint(1, 3)
+            for _ in range(scroll_count):
+                await self.page.evaluate("window.scrollBy(0, 300);")
+                await self._human_sleep(1, 2)
+                
+            # Click back to close
+            await self.page.click("body")
+            await self._human_sleep(1, 2)
+            
+            logger.debug(f"Worker {self.worker_id}: Performed notifications activity")
+        except Exception as e:
+            logger.warning(f"Worker {self.worker_id}: Notifications activity failed: {e}")
+
+    async def _check_my_network_activity(self):
+        """Check my network page"""
+        try:
+            await self.page.click("a[data-test-global-nav-link='mynetwork']")
+            await self._human_sleep(2, 4)
+            
+            # Scroll through network page
+            scroll_count = random.randint(1, 3)
+            for _ in range(scroll_count):
+                await self.page.evaluate("window.scrollBy(0, 300);")
+                await self._human_sleep(1, 2)
+                
+            logger.debug(f"Worker {self.worker_id}: Performed my network activity")
+        except Exception as e:
+            logger.warning(f"Worker {self.worker_id}: My network activity failed: {e}")
+
+    async def _check_messaging_activity(self):
+        """Check messaging page"""
+        try:
+            await self.page.click("a[data-test-global-nav-link='messaging']")
+            await self._human_sleep(2, 4)
+            
+            # Scroll through messages
+            await self.page.evaluate("window.scrollBy(0, 200);")
+            await self._human_sleep(1, 2)
+            
+            logger.debug(f"Worker {self.worker_id}: Performed messaging activity")
+        except Exception as e:
+            logger.warning(f"Worker {self.worker_id}: Messaging activity failed: {e}")
+
+    async def _visit_own_profile_activity(self):
+        """Visit own profile"""
+        try:
+            # Click on profile picture/menu
+            await self.page.click("button.global-nav__me-photo")
+            await self._human_sleep(1, 2)
+            
+            # Click "View profile"
+            profile_link = await self.page.query_selector("a[href*='/in/'][data-link-to='profile']")
+            if profile_link:
+                await profile_link.click()
+                await self._human_sleep(3, 5)
+                
+                # Scroll profile
+                await self._scroll_page()
+                
+            logger.debug(f"Worker {self.worker_id}: Performed own profile visit activity")
+        except Exception as e:
+            logger.warning(f"Worker {self.worker_id}: Own profile activity failed: {e}")
+
     async def cleanup(self):
+        for task in asyncio.all_tasks():
+            if task.get_name().startswith(f"activity_simulation_{self.worker_id}"):
+                task.cancel()
         try:
             if self.page:
                 await self.page.close()
@@ -395,8 +562,6 @@ class PlaywrightProfileScraper:
             if "checkpoint" in self.page.url or "challenge" in self.page.url:
                 logger.warning(f"Worker {self.worker_id}: Hit verification challenge: {self.page.url}")
                 
-                # Save screenshot for debugging
-                
                 # Check for email verification option
                 try:
                     email_button = await self.page.wait_for_selector("button[data-auth-method='EMAIL']", timeout=5000)
@@ -463,17 +628,25 @@ class PlaywrightProfileScraper:
             return False
     
     async def scrape_profile(self, profile_url: str):
-        """Scrape a LinkedIn profile with robust error handling"""
-        if not self.session_start_time:
-             self.session_start_time = datetime.now()
+        """Scrape a LinkedIn profile with robust error handling and processed URL tracking"""
 
+        if not self.session_start_time:
+            self.session_start_time = datetime.now()
+
+        # Check cooldown status first - if in cooldown, don't process anything
         if self.in_cooldown:
             if datetime.now() < self.cooldown_until:
-                logger.info(f"Worker {self.worker_id}: In cooldown until {self.cooldown_until}")
+                remaining_time = (self.cooldown_until - datetime.now()).total_seconds()
+                logger.warning(f"Worker {self.worker_id}: In cooldown until {self.cooldown_until} ({remaining_time/3600:.1f} hours remaining)")
                 return None
             else:
+                logger.info(f"Worker {self.worker_id}: Cooldown expired, resuming operations")
                 self.in_cooldown = False
-        
+                # Clear cooldown state
+                state = load_state()
+                state[f"worker_{self.worker_id}_cooldown"] = {"in_cooldown": False, "cooldown_until": None}
+                save_state(state)
+
         # Check if session needs to be refreshed
         if (
             datetime.now() - self.session_start_time > self.session_duration_limit or 
@@ -482,16 +655,21 @@ class PlaywrightProfileScraper:
             logger.info(f"Worker {self.worker_id}: Session limit reached. Reinitializing browser.")
             await self.cleanup()
             await self.initialize()
-            self.is_logged_in = False
-        
+
         # Ensure logged in
         if not self.is_logged_in:
             login_success = await self.login()
             if not login_success:
                 logger.error(f"Worker {self.worker_id}: Failed to login")
                 return None
-        
+
+        # --- Skip if already processed ---
         state = load_state()
+        if profile_url in state.get("processed_urls", []):
+            logger.info(f"Worker {self.worker_id}: Profile {profile_url} already processed, skipping.")
+            return None
+
+        # Get previous scraping state for this profile
         profile_state = state.get(profile_url, {})
         last_post_time = profile_state.get("last_post_time")
         last_comment_time = profile_state.get("last_comment_time")
@@ -500,53 +678,42 @@ class PlaywrightProfileScraper:
         # Initialize profile data structure
         profile_data = {
             'basic_info': {},
-            # 'about': '',
             'experience': [],
-            # 'education': [],
-            # 'skills': [],
-            # 'certifications': [],
             'scraped_at': datetime.now().isoformat(),
             'profile_url': profile_url,
             'scraper_worker_id': self.worker_id
         }
-        
+
         try:
             # Navigate to profile
             logger.info(f"Worker {self.worker_id}: Navigating to {profile_url}")
-            
-            await self.page.goto(profile_url, wait_until="domcontentloaded")
+            await self.page.goto(profile_url, wait_until="domcontentloaded", timeout=30000)
             await self._human_sleep(2, 4)
-            
+
             # Check if we need to handle sign-in wall
             await self._handle_sign_in_wall()
-            
+
             # Scroll the page to trigger lazy loading
             await self._scroll_page()
-            
+
             # Save page screenshot and source for debugging
             if logger.level == logging.DEBUG:
                 content = await self.page.content()
                 with open(f"profile_source_{self.worker_id}.html", "w", encoding="utf-8") as f:
                     f.write(content)
-            
+
             # Check for blocks or limits
             if await self._check_for_blocks():
                 logger.warning(f"Worker {self.worker_id}: Detected block or limit")
                 self._enter_cooldown()
                 return None
-            
+
             # Extract profile sections
             logger.info(f"Worker {self.worker_id}: Extracting profile data")
             html = await self.page.content()
             profile_data['basic_info'] = await self._extract_basic_info()
-            # profile_data['about'] = await self._extract_about()
             profile_data['experience'] = self._extract_experience(html)
-            # profile_data['education'] = await self._extract_education()
-            # profile_data['skills'] = await self._extract_skills()
-            # profile_data['certifications'] = await self._extract_certifications()
 
-         
-            
             # Extract activity data if configured
             if self.config.get('scrape_activity', False):
                 logger.info(f"Worker {self.worker_id}: Extracting activity data")
@@ -557,30 +724,33 @@ class PlaywrightProfileScraper:
                     last_reaction_time
                 )
                 profile_data['activity'] = activity_data
-            
-            # Increment the profile count
-            self.profiles_scraped += 1
-            
-            # Save the profile data
-            self._save_profile_data(profile_data)
-             # --- NEW: Save the latest timestamps for incremental scraping ---
-            if self.config.get('scrape_activity', False):
+
+                # Save the latest timestamps for incremental scraping
                 state[profile_url] = new_times
                 save_state(state)
-            
+
+            # Increment the profile count
+            self.profiles_scraped += 1
+
+            # Save the profile data
+            self._save_profile_data(profile_data)
+
+            # --- Mark as processed ---
+            if "processed_urls" not in state:
+                state["processed_urls"] = []
+            if profile_url not in state["processed_urls"]:
+                state["processed_urls"].append(profile_url)
+                save_state(state)
+
             logger.info(f"Worker {self.worker_id}: Successfully scraped profile {profile_url}")
-            
-            # Add randomization between profiles to avoid detection
-            if random.random() < 0.1:  # 10% chance to simulate more random behavior
-                await self._perform_random_actions()
-            
+
             return profile_data
-            
+
         except Exception as e:
             logger.error(f"Worker {self.worker_id}: Error scraping profile {profile_url}: {e}")
             logger.debug(traceback.format_exc())
             return None
-    
+
     async def _handle_sign_in_wall(self):
         """Handle the LinkedIn sign-in wall if it appears"""
         try:
@@ -651,59 +821,149 @@ class PlaywrightProfileScraper:
         await self._human_sleep(1.0, 2.5)
     
     async def _check_for_blocks(self):
-        """Check if we've been blocked or limited"""
+        """
+        Improved block/captcha detection:
+        - Checks for known block URLs.
+        - Checks for visible or structural CAPTCHA in HTML (not just the word).
+        - Only blocks on visible reCAPTCHA iframe.
+        - Logs findings for debugging.
+        """
         try:
-            # Get page source and URL
-            content = await self.page.content()
-            current_url = self.page.url
-            
-            # Check for block indicators in content
-            block_indicators = [
-                "you've reached the commercial use limit",
-                "please verify you're a person",
-                "unusual activity from your account",
-                "we've restricted your account temporarily",
-                "security verification",
-                "we need to verify it's you",
-                "we've detected an issue with your account",
-                "this profile is not available",
-                "this page is no longer available",
-                "this profile doesn't exist"
+            current_url = self.page.url.lower()
+            html = await self.page.content()
+            blocked = False
+
+            # 1. URL-based block detection (very reliable)
+            block_url_keywords = [
+                "/checkpoint", "/authwall", "/login", "/signup", "/challenge", "/verify"
             ]
-            
-            for indicator in block_indicators:
-                if indicator.lower() in content.lower():
-                    logger.warning(f"Worker {self.worker_id}: Detected block indicator: '{indicator}'")
-                    return True
-            
-            # Check for redirects
-            redirect_indicators = [
-                "linkedin.com/checkpoint",
-                "linkedin.com/authwall",
-                "linkedin.com/psettings",
-                "linkedin.com/uas",
-                "linkedin.com/login"
-            ]
-            
-            for indicator in redirect_indicators:
-                if indicator in current_url and "/in/" not in current_url:
-                    logger.warning(f"Worker {self.worker_id}: Detected redirect to {current_url}")
-                    return True
-            
-            return False
-            
+            for kw in block_url_keywords:
+                if kw in current_url:
+                    logger.warning(f"Worker {self.worker_id}: Block detected by URL: '{kw}' in '{current_url}'")
+                    blocked = True
+
+            # 2. Visible reCAPTCHA iframe (not just present in DOM)
+            recaptcha_iframes = await self.page.query_selector_all('iframe[src*="recaptcha"]')
+            recaptcha_visible = False
+
+            for iframe in recaptcha_iframes:
+                box = await iframe.bounding_box()
+                if box and box['height'] > 20 and box['width'] > 20:
+                    recaptcha_visible = True
+                    break
+
+            if recaptcha_visible:
+                logger.warning(f"Worker {self.worker_id}: **Visible** reCAPTCHA iframe detected on the page")
+                blocked = True
+            elif recaptcha_iframes:
+                logger.info(f"Worker {self.worker_id}: reCAPTCHA iframe(s) present but not visible—continuing")
+
+            # 3. Common structural CAPTCHA triggers in HTML (not just the word)
+            if (
+                '<strong>reCAPTCHA</strong>' in html
+                or 'id="captcha"' in html
+                or 'class="g-recaptcha"' in html
+            ):
+                logger.warning(f"Worker {self.worker_id}: CAPTCHA widget detected in HTML")
+                blocked = True
+
+            # 4. Heuristic: page overlays asking to verify identity/human
+            if "please verify you are a human" in html.lower():
+                logger.warning(f"Worker {self.worker_id}: Human verification message found")
+                blocked = True
+
+            # 5. Save HTML for debugging if a block was detected
+            if blocked:
+                with open(f"debug_block_page_{self.worker_id}.html", "w", encoding="utf-8") as f:
+                    f.write(html)
+
+            return blocked
+
         except Exception as e:
             logger.error(f"Worker {self.worker_id}: Error checking for blocks: {e}")
             return False
-    
-    def _enter_cooldown(self):
-        """Enter a cooldown period to avoid detection"""
-        cooldown_hours = random.uniform(2, 4)
-        self.cooldown_until = datetime.now() + timedelta(hours=cooldown_hours)
+        
+    def _enter_cooldown(self, hours=None):
+        """
+        Enter a cooldown period to avoid detection
+        Optionally specify cooldown duration in hours, otherwise uses random default
+        """
+        if hours is None:
+            hours = random.uniform(2, 4)
+        
+        self.cooldown_until = datetime.now() + timedelta(hours=hours)
         self.in_cooldown = True
         
+        # Save the cooldown state to persist across restarts
+        try:
+            state = load_state()
+            state[f"worker_{self.worker_id}_cooldown"] = {
+                "in_cooldown": True,
+                "cooldown_until": self.cooldown_until.isoformat()
+            }
+            save_state(state)
+        except Exception as e:
+            logger.error(f"Worker {self.worker_id}: Failed to save cooldown state: {e}")
+        
         logger.warning(f"Worker {self.worker_id}: Entering cooldown until {self.cooldown_until}")
-    
+
+    def _check_cooldown_state(self):
+        """Check if worker should be in cooldown based on saved state"""
+        try:
+            state = load_state()
+            worker_state = state.get(f"worker_{self.worker_id}_cooldown", {})
+            
+            if worker_state.get("in_cooldown", False):
+                cooldown_until = datetime.fromisoformat(worker_state.get("cooldown_until", ""))
+                
+                if datetime.now() < cooldown_until:
+                    self.in_cooldown = True
+                    self.cooldown_until = cooldown_until
+                    logger.info(f"Worker {self.worker_id}: Restored cooldown state until {cooldown_until}")
+                else:
+                    # Cooldown expired
+                    self.in_cooldown = False
+                    self.cooldown_until = None
+                
+            # Clear the cooldown state
+            state[f"worker_{self.worker_id}_cooldown"] = {
+                "in_cooldown": False,
+                "cooldown_until": None
+            }
+            save_state(state)
+            
+            logger.info(f"Worker {self.worker_id}: Cooldown expired")
+        except Exception as e:
+            logger.error(f"Worker {self.worker_id}: Error checking cooldown state: {e}")
+
+    async def refresh_session(self):
+        """Refresh the session to avoid timeouts/logouts"""
+        try:
+            logger.info(f"Worker {self.worker_id}: Refreshing session")
+
+            # Navigate to LinkedIn homepage
+            await self.page.goto("https://www.linkedin.com/", wait_until="domcontentloaded")
+            await self._human_sleep(2, 4)
+
+            # Check if we need to re-login
+            if await self._is_authwall_present():
+                logger.info(f"Worker {self.worker_id}: Session expired, logging in again")
+                await self.login()
+            else:
+                logger.info(f"Worker {self.worker_id}: Session still valid")
+                
+            # Save cookies to maintain session for next time
+            cookie_path = f"cookies_worker_{self.worker_id}.json"
+            await self.save_cookies(self.context, cookie_path)
+
+            # Reset session start time
+            self.session_start_time = datetime.now()
+            return True
+
+        except Exception as e:
+            logger.error(f"Worker {self.worker_id}: Error refreshing session: {e}")
+            return False
+
     async def _perform_random_actions(self):
         """Perform random actions to simulate natural browsing"""
         try:
@@ -712,7 +972,7 @@ class PlaywrightProfileScraper:
                 self._check_notifications_action,
                 self._hover_random_elements_action
             ]
-            
+                    
             # Choose 1-2 random actions
             num_actions = random.randint(1, 2)
             selected_actions = random.sample(actions, num_actions)
@@ -720,7 +980,7 @@ class PlaywrightProfileScraper:
             for action in selected_actions:
                 await action()
                 await self._human_sleep(1, 3)
-                
+                    
         except Exception as e:
             logger.error(f"Worker {self.worker_id}: Error performing random actions: {e}")
     
@@ -855,211 +1115,295 @@ class PlaywrightProfileScraper:
 
     def safe_get_text(self, soup_elem):
         return soup_elem.get_text(strip=True) if soup_elem else None
-
-    def _extract_role(self, li, is_ungrouped=False):
-        # Title
-        title = None
-        title_elem = li.select_one(".mr1.hoverable-link-text.t-bold span[aria-hidden='true']")
-        if not title_elem:
-            title_elem = li.select_one(".mr1.hoverable-link-text.t-bold")
-        if title_elem:
-            title = title_elem.get_text(strip=True)
-
-        # Date range - try multiple selectors
-        date_range = None
-        # First try the standard selector
-        date_elem = li.select_one(".pvs-entity__caption-wrapper[aria-hidden='true']")
-        if date_elem:
-            date_range = date_elem.get_text(strip=True)
-        else:
-            # Fallback: look for spans with date patterns in t-black--light spans
-            date_spans = li.select("span.t-14.t-normal.t-black--light span[aria-hidden='true']")
-            for span in date_spans:
-                text = span.get_text(strip=True)
-                # Check if it looks like a date range (contains digits and time indicators)
-                if (any(char.isdigit() for char in text) and 
-                    ('·' in text or '-' in text or 'to' in text.lower()) and
-                    ('mos' in text or 'yr' in text or 'month' in text or 'year' in text)):
-                    date_range = text
-                    break
-
-        # Location - find spans that look like locations
-        location = None
-        location_spans = li.select("span.t-14.t-normal.t-black--light span[aria-hidden='true']")
-        for span in location_spans:
-            text = span.get_text(strip=True)
-            # Location typically contains location keywords and is not the date
-            if (text != date_range and 
-                (',' in text or 'Remote' in text or 'India' in text or 'Mumbai' in text or 'Maharashtra' in text)):
-                location = text
-                break
-
-        # Description - try multiple selectors for description content
-        description = None
-        desc_selectors = [
-            ".sijsBosfJTeOOcQcHewSIFlxgWMjZaico span[aria-hidden='true']",
-            "div.full-width.t-14.t-normal.t-black.display-flex.align-items-center span[aria-hidden='true']",
-            ".inline-show-more-text span[aria-hidden='true']"
-        ]
-        
-        for selector in desc_selectors:
-            desc_elem = li.select_one(selector)
-            if desc_elem:
-                desc_text = desc_elem.get_text(separator="\n", strip=True)
-                # Make sure it's not just skills or other metadata
-                if len(desc_text) > 50:  # Only consider substantial descriptions
-                    description = desc_text
-                    break
-
-        if title:
-            return {
-                "title": title,
-                "date_range": date_range,
-                "location": location,
-                "description": description
-            }
-        return None
-
+       
     def _is_grouped_experience(self, top_li):
-        """
-        Determine if this is grouped by analyzing HTML structure patterns, not content
-        """
-        # Method 1: Check for multiple nested role items (most reliable)
-        nested_uls = top_li.select("ul.WgIFHisduBdzsrWAQusrmrSnsmWzyvZPoKDpc")
-        
+        """Check if this is a grouped experience (multiple roles at same company)"""
+        # Look for nested ul elements that contain multiple li items (roles)
+        nested_uls = top_li.find_all("ul", recursive=True)
         for ul in nested_uls:
-            if ul.find_parent('li') == top_li:  # Direct child ul
+            # Make sure this ul is a direct child structure of the top li
+            parent_li = ul.find_parent('li')
+            if parent_li == top_li:
                 role_lis = ul.find_all('li', recursive=False)
-                if len(role_lis) > 1:  # Multiple roles = definitely grouped
+                # Filter out non-role items (like skills sections)
+                actual_roles = []
+                for li in role_lis:
+                    # Check if this li contains a job title
+                    title_spans = li.select('span[aria-hidden="true"]')
+                    for span in title_spans:
+                        text = span.get_text(strip=True)
+                        # Skip if it looks like skills or other metadata
+                        if text and not any(skip_word in text.lower() for skip_word in ['skills', 'see more', '…see more']):
+                            # Check if parent structure suggests it's a job title
+                            parent_div = span.find_parent('div')
+                            if parent_div and ('hoverable-link-text' in parent_div.get('class', []) or 't-bold' in parent_div.get('class', [])):
+                                actual_roles.append(li)
+                                break
+                
+                if len(actual_roles) > 1:
                     return True
-        
-        # Method 2: Check for "Company · Job Type" pattern at MAIN LEVEL only
-        # This pattern only exists in ungrouped experiences at the main level
-        main_content_div = top_li.select_one("div.display-flex.flex-column.align-self-center.flex-grow-1")
-        if main_content_div:
-            main_row_div = main_content_div.select_one("div.display-flex.flex-row.justify-space-between")
-            if main_row_div:
-                # Only check spans that are direct children of the main row, not nested ones
-                company_spans = main_row_div.select("span.t-14.t-normal:not(.t-black--light) span[aria-hidden='true']")
-                for span in company_spans:
-                    text = span.get_text(strip=True)
-                    if "·" in text and not any(char.isdigit() for char in text):
-                        # This looks like "Company Name · Job Type" = ungrouped
-                        return False
-        
-        # Method 3: Check for complex sub-components structure
-        # Grouped experiences have multiple nested items with role details
-        sub_components = top_li.select("div.CraoorGRCeibcmAFEClEpvZwdgMjeMRZNAY.pvs-entity__sub-components")
-        if sub_components:
-            # Count nested items that have role-like structure (contain t-bold elements)
-            nested_items_with_roles = top_li.select("li.ZbRaWpTCciIYYqsUKYLBXeWDyhYxXLKmw .mr1.hoverable-link-text.t-bold")
-            if len(nested_items_with_roles) > 1:  # Multiple role titles = grouped
-                return True
-        
-        # Method 4: Check date location patterns
-        # Find the main row area first
-        main_row_div = top_li.select_one("div.display-flex.flex-row.justify-space-between")
-        if main_row_div:
-            main_level_dates = main_row_div.select(".pvs-entity__caption-wrapper")
-            nested_level_dates = top_li.select("ul.WgIFHisduBdzsrWAQusrmrSnsmWzyvZPoKDpc .pvs-entity__caption-wrapper")
-            
-            if main_level_dates and not nested_level_dates:
-                return False  # Dates only at main level = ungrouped
-            elif nested_level_dates and not main_level_dates:
-                return True   # Dates only in nested items = grouped
-        
-        # Method 5: Fallback - if we have any nested ul structure, likely grouped
-        if nested_uls:
-            return True
-        
         return False
 
-    def _extract_experience(self, html):
+    def _extract_role(self,li, is_ungrouped):
+        """Extract a single role from an li element"""
+        role = {
+            "title": None,
+            "dates": None,
+            "location": None
+        }
+        
+        # Extract job title - look for spans with aria-hidden="true" in hoverable-link-text divs
+        title_spans = li.select('div.hoverable-link-text.t-bold span[aria-hidden="true"]')
+        if not title_spans:
+            # Alternative selector for titles
+            title_spans = li.select('span[aria-hidden="true"]')
+            for span in title_spans:
+                text = span.get_text(strip=True)
+                if text and not any(skip_word in text.lower() for skip_word in ['skills', 'see more', '…see more', 'full-time', 'part-time', 'internship']):
+                    parent_div = span.find_parent('div')
+                    if parent_div and ('hoverable-link-text' in parent_div.get('class', []) or 't-bold' in parent_div.get('class', [])):
+                        role["title"] = text
+                        break
+        else:
+            role["title"] = title_spans[0].get_text(strip=True)
+        
+        if not role["title"]:
+            return None
+
+        # Extract dates and location using LinkedIn's standard structure
+        # LinkedIn typically structures role info as: Title -> Company/Duration -> Date -> Location
+        
+        # Get all text spans in order
+        all_spans = li.select('span[aria-hidden="true"]')
+        span_texts = []
+        
+        for span in all_spans:
+            text = span.get_text(strip=True)
+            if text:
+                span_texts.append(text)
+        
+        # Extract dates first - look for patterns with years, months, duration
+        date_patterns = ['present', '20', 'yr', 'mo', 'month', 'year', ' - ', '·']
+        for text in span_texts:
+            if text == role["title"]:
+                continue
+                
+            # Check if this looks like a date/duration
+            text_lower = text.lower()
+            has_date_indicators = any(pattern in text_lower for pattern in date_patterns)
+            
+            # Additional check for date format patterns
+            has_date_format = (
+                ('20' in text and len(text) > 4) or  # Contains year
+                (' - ' in text) or  # Date range
+                ('·' in text and ('yr' in text_lower or 'mo' in text_lower)) or  # Duration
+                'present' in text_lower
+            )
+            
+            if has_date_indicators and has_date_format and not role["dates"]:
+                role["dates"] = text
+                break
+        
+        # Extract location - it's typically the remaining text that's not title, dates, or company info
+        for text in span_texts:
+            if text == role["title"] or text == role.get("dates"):
+                continue
+                
+            # Skip company info patterns (contains employment type indicators)
+            if '·' in text and any(work_type in text.lower() for work_type in ['full-time', 'part-time', 'internship', 'contract']):
+                continue
+                
+            # Skip if it looks like a company name (no location-specific patterns)
+            text_lower = text.lower()
+            
+            # Generic location patterns (not hardcoded places)
+            location_patterns = [
+                '·', # Often separates location from work type
+                ',',  # City, State format
+                'area',  # Geographic area indicator
+                'region',  # Geographic region
+                'metroplex',  # Metro area
+                'remote',  # Work arrangement
+                'hybrid',  # Work arrangement
+                'on-site',  # Work arrangement
+                'onsite'  # Work arrangement
+            ]
+            
+            # Check if text has location-like patterns
+            has_location_pattern = any(pattern in text_lower for pattern in location_patterns)
+            
+            # Additional structural checks
+            is_likely_location = (
+                has_location_pattern or
+                (', ' in text and len(text.split(', ')) >= 2) or  # City, State pattern
+                text.endswith(' Area') or
+                text.endswith(' Region') or
+                text.endswith(' Metroplex') or
+                ('·' in text and not any(work_type in text_lower for work_type in ['full-time', 'part-time', 'internship']))
+            )
+            
+            if is_likely_location and not role["location"]:
+                role["location"] = text
+                break
+        
+        # Alternative approach: use caption wrappers which often contain structured data
+        if not role["dates"] or not role["location"]:
+            caption_spans = li.select('span.pvs-entity__caption-wrapper[aria-hidden="true"]')
+            
+            for i, span in enumerate(caption_spans):
+                text = span.get_text(strip=True)
+                if not text:
+                    continue
+                    
+                # First caption wrapper is usually dates
+                if i == 0 and not role["dates"]:
+                    # Check if it looks like a date
+                    if any(pattern in text.lower() for pattern in ['20', 'present', 'yr', 'mo', ' - ']):
+                        role["dates"] = text
+                        
+                # Second caption wrapper or non-date text is usually location
+                elif not role["location"]:
+                    # If it doesn't look like a date, treat as location
+                    if not any(pattern in text.lower() for pattern in ['20', 'present', 'yr', 'mo']) or '·' in text:
+                        role["location"] = text
+
+        return role
+    
+    def _find_experience_section(self,soup: BeautifulSoup):
+        """Find the experience section in the HTML"""
+        # Look for the section with id="experience" or containing "Experience" header
+        exp_section = soup.find('div', {'id': 'experience'})
+        if exp_section:
+            return exp_section.find_parent('section')
+        
+        # Fallback: look for headers containing "Experience"
+        headers = soup.find_all(['h2', 'h3'])
+        for h in headers:
+            if 'experience' in h.get_text(strip=True).lower():
+                return h.find_parent('section') or h.find_parent('div')
+        return None
+
+    def _extract_experience(self, html: str) -> Dict[str, Any]:
+        """Main function to extract all experience data"""
         soup = BeautifulSoup(html, "html.parser")
         experience = {}
 
-        exp_list = soup.select_one('ul.WgIFHisduBdzsrWAQusrmrSnsmWzyvZPoKDpc')
+        exp_section = self._find_experience_section(soup)
+        if not exp_section:
+            return experience
+
+        exp_list = exp_section.find("ul")
         if not exp_list:
             return experience
 
-        for top_li in exp_list.find_all('li', recursive=False):
+        # Get all top-level experience items
+        top_level_items = exp_list.find_all('li', recursive=False)
+        
+        for i, top_li in enumerate(top_level_items):
+            # Skip items that don't look like experience entries
+            if not top_li.select('div.hoverable-link-text'):
+                continue
+
             company_name = None
             company_url = None
             total_period = None
-            
-            # Get company URL from any optional-action-target-wrapper link
+            company_location = None
+
+            # Extract company URL
             company_link_elem = top_li.select_one("a.optional-action-target-wrapper")
             if company_link_elem:
                 company_url = company_link_elem.get('href')
 
-            # Determine if this is grouped or ungrouped
             is_grouped = self._is_grouped_experience(top_li)
-            
-            if is_grouped:
-                # GROUPED EXPERIENCE
-                # Company name is in the FIRST t-bold element (direct child of top_li)
-                # We need to be very specific to avoid nested role titles
-                main_content_div = top_li.select_one("div.display-flex.flex-column.align-self-center.flex-grow-1")
-                if main_content_div:
-                    company_name_elem = main_content_div.select_one("div.display-flex.flex-row.justify-space-between .mr1.hoverable-link-text.t-bold span[aria-hidden='true']")
-                    if not company_name_elem:
-                        company_name_elem = main_content_div.select_one("div.display-flex.flex-row.justify-space-between .mr1.hoverable-link-text.t-bold")
-                    if company_name_elem:
-                        company_name = company_name_elem.get_text(strip=True)
-                
-                # Total period - get from the FIRST span.t-14.t-normal at the main level (not from nested roles)
-                if main_content_div:
-                    main_row_div = main_content_div.select_one("div.display-flex.flex-row.justify-space-between")
-                    if main_row_div:
-                        period_span = main_row_div.select_one("span.t-14.t-normal span[aria-hidden='true']")
-                        if period_span:
-                            text = period_span.get_text(strip=True)
-                            # This should be the total period like "4 yrs 1 mo"
-                            if 'yrs' in text or 'mos' in text or 'yr' in text or 'mo' in text:
-                                total_period = text
-                            
-            else:
-                # UNGROUPED EXPERIENCE
-                # Company name and job type are in "Company Name · Job Type" format
-                # Look for the first span.t-14.t-normal that's not in t-black--light
-                company_spans = top_li.select("span.t-14.t-normal:not(.t-black--light) span[aria-hidden='true']")
-                for span in company_spans:
-                    text = span.get_text(strip=True)
-                    if "·" in text and not any(char.isdigit() for char in text):
-                        # This should be "Company Name · Job Type"
-                        parts = text.split("·", 1)  # Split only on first ·
-                        company_name = parts[0].strip()
-                        if len(parts) > 1:
-                            total_period = parts[1].strip()
-                        break
-                    elif text and not any(char.isdigit() for char in text) and len(text) > 3:
-                        # Fallback: just company name without job type
-                        company_name = text.strip()
 
-            # Use company name as key, fallback to generated key
-            company_key = company_name if company_name else f"company_{id(top_li)}"
-            
-            if company_key not in experience:
+            if is_grouped:
+                # For grouped experiences, extract company info from the top level
+                main_div = top_li.select_one("div.display-flex.flex-column.align-self-center.flex-grow-1")
+                if main_div:
+                    # Look for company name in hoverable-link-text spans
+                    company_elem = main_div.select_one("div.hoverable-link-text.t-bold span[aria-hidden='true']")
+                    if company_elem:
+                        company_name = company_elem.get_text(strip=True)
+
+                    # Look for total period and company location
+                    all_spans = main_div.select("span[aria-hidden='true']")
+                    for span in all_spans:
+                        text = span.get_text(strip=True)
+                        if not text:
+                            continue
+                            
+                        # Check for total period (duration)
+                        if ('yr' in text.lower() or 'mo' in text.lower() or 'year' in text.lower() or 'month' in text.lower()) and not total_period:
+                            total_period = text
+                        # Check for company location (not company name, not duration)
+                        elif not company_location and text != company_name and text != total_period:
+                            # Generic location pattern detection
+                            text_lower = text.lower()
+                            location_patterns = [
+                                'area', 'region', 'metroplex', 'county', 'district',
+                                'remote', 'hybrid', 'on-site', 'onsite',
+                                ',',  # Geographic separator
+                                '·'   # LinkedIn separator
+                            ]
+                            
+                            # Check if this looks like a location
+                            is_location = (
+                                any(pattern in text_lower for pattern in location_patterns) or
+                                (', ' in text and len(text.split(', ')) >= 2) or  # City, State format
+                                text.endswith(' Area') or
+                                text.endswith(' Region') or
+                                text.endswith(' Metroplex')
+                            )
+                            
+                            if is_location:
+                                company_location = text
+
+                company_key = company_name if company_name else f"company_{i}"
+                if company_key not in experience:
+                    experience[company_key] = {
+                        "company_url": company_url,
+                        "total_period": total_period,
+                        "positions": []
+                    }
+
+                # Extract individual roles from nested lists
+                nested_uls = top_li.find_all("ul", recursive=True)
+                for ul in nested_uls:
+                    if ul.find_parent('li') == top_li:
+                        for role_li in ul.find_all('li', recursive=False):
+                            role = self._extract_role(role_li, is_ungrouped=False)
+                            if role:
+                                # If role doesn't have location but company does, use company location
+                                if not role["location"] and company_location:
+                                    role["location"] = company_location
+                                experience[company_key]["positions"].append(role)
+            else:
+                # For ungrouped experiences, extract company info differently
+                # Look for company name in the span.t-14.t-normal text (like "Zinc Technologies · Internship")
+                company_span = top_li.select_one("span.t-14.t-normal span[aria-hidden='true']")
+                if company_span:
+                    company_text = company_span.get_text(strip=True)
+                    # Extract company name (before the · symbol)
+                    if '·' in company_text:
+                        company_name = company_text.split('·')[0].strip()
+                    else:
+                        company_name = company_text
+                
+                # If no company name found, use the job title as fallback
+                if not company_name:
+                    title_elem = top_li.select_one("div.hoverable-link-text.t-bold span[aria-hidden='true']")
+                    if title_elem:
+                        company_name = title_elem.get_text(strip=True)
+                
+                company_key = company_name if company_name else f"company_{i}"
+                
+                # For ungrouped, each top-level li is a separate company, so always create new entry
                 experience[company_key] = {
                     "company_url": company_url,
                     "total_period": total_period,
                     "positions": []
                 }
-
-            if is_grouped:
-                # GROUPED: Extract roles from nested ul elements
-                nested_uls = top_li.select("ul.WgIFHisduBdzsrWAQusrmrSnsmWzyvZPoKDpc")
-                for ul in nested_uls:
-                    # Only process direct child ul elements
-                    if ul.find_parent('li') == top_li:
-                        for role_li in ul.find_all('li', recursive=False):
-                            # Skip li elements that don't contain role info (like skills)
-                            if role_li.select_one(".mr1.hoverable-link-text.t-bold"):
-                                role = self._extract_role(role_li, is_ungrouped=False)
-                                if role:
-                                    experience[company_key]["positions"].append(role)
-            else:
-                # UNGROUPED: Extract single role from the main li
+                
                 role = self._extract_role(top_li, is_ungrouped=True)
                 if role:
                     experience[company_key]["positions"].append(role)
@@ -1450,40 +1794,51 @@ class PlaywrightProfileScraper:
     async def efficient_scroll_page(self, page, max_scrolls=100, scroll_pause=1, patience=3):
         """
         Scrolls the main page efficiently and patiently to ensure all activity cards are loaded.
+        Stops early if 0 cards are found for 'patience' consecutive scrolls.
         This is the correct method for the 'Comments' activity feed.
         """
         last_count = 0
         stagnant_scrolls = 0
-        
+        zero_scrolls = 0  # Tracks consecutive zero-card scrolls
+
         print("🔁 Starting smart scroll of the main page to load all activity cards...")
-        
+
         for i in range(max_scrolls):
             # 1. Count the number of loaded activity cards
-            # This selector must match the main list item for each activity
             current_count = await page.evaluate(
                 "document.querySelectorAll('ul.display-flex.flex-wrap.list-style-none.justify-center > li').length"
             )
             
             print(f"Scroll {i+1}/{max_scrolls}: Found {current_count} cards (previously {last_count}).")
 
-            # 2. Check if scrolling has stalled
+            # Stop if 0 cards found for 'patience' consecutive scrolls
+            if current_count == 0:
+                zero_scrolls += 1
+                if zero_scrolls >= patience:
+                    print(f"No cards found for {patience} consecutive scrolls. Stopping scroll.")
+                    break
+            else:
+                zero_scrolls = 0
+
+            # Check if scrolling has stalled (no new cards loaded for 'patience' scrolls)
             if current_count == last_count and last_count > 0:
                 stagnant_scrolls += 1
                 if stagnant_scrolls >= patience:
                     print(f"No new cards loaded for {patience} consecutive scrolls. Assuming all are loaded.")
                     break
             else:
-                stagnant_scrolls = 0  # Reset counter if new content is found
-            
+                stagnant_scrolls = 0  # Reset if new content is found
+
             last_count = current_count
-            
-            # 3. Scroll the entire page window to the bottom
+
+            # 3. Scroll to bottom
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            
+
             # 4. Wait for new content to load
             await asyncio.sleep(scroll_pause)
-                
+
         print(f"🏁 Finished scrolling. A total of {last_count} cards are loaded and ready for extraction.")
+
 
     async def _extract_comments(self, since_timestamp=None, max_comments=None):
         """
@@ -1812,6 +2167,10 @@ class LinkedInMassProfileScraper:
         self.running = False
         self.lock = threading.Lock()
         
+        self.file_watcher = None
+        if config.get('profile_file'):
+            self.file_watcher = ProfileFileWatcher(config.get('profile_file'), self.profile_queue)
+        
         # Load proxy list if provided
         self.proxies = self._load_proxies(config.get('proxy_file'))
         
@@ -1921,6 +2280,9 @@ class LinkedInMassProfileScraper:
         self.running = True
         logger.info(f"Starting scraping with {len(self.worker_pool)} workers")
         
+        if self.file_watcher:
+            self.file_watcher.start()
+    
         # Create and start worker threads
         threads = []
         for i, worker in enumerate(self.worker_pool):
@@ -1962,32 +2324,54 @@ class LinkedInMassProfileScraper:
         logger.info("Scraping completed")
     
     def _worker_thread(self, worker):
-        """Worker thread function that processes profiles"""
+        """Worker thread with improved async handling"""
         with self.lock:
             self.active_workers += 1
         
         try:
-            # Create event loop for this thread
-            asyncio.set_event_loop(asyncio.new_event_loop())
+            # Create new event loop for this thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             
             # Initialize the worker
-            init_success = asyncio.get_event_loop().run_until_complete(worker.initialize())
-            if not init_success or not worker.page:
-                logger.error(f"Worker {worker.worker_id}: Initialization failed. Skipping this worker.")
-                return  # Exit this thread, don't continue
-                        
+            init_success = loop.run_until_complete(worker.initialize())
+            if not init_success:
+                logger.error(f"Worker {worker.worker_id}: Initialization failed")
+                return
+                
+            last_profile_time = time.time()
+
             while self.running:
                 try:
-                    # Get next profile URL with timeout
+                    # Check if worker is in cooldown
+                    if worker.in_cooldown and worker.cooldown_until:
+                        remaining_cooldown = (worker.cooldown_until - datetime.now()).total_seconds()
+                        if remaining_cooldown > 0:
+                            logger.info(f"Worker {worker.worker_id}: In cooldown for {remaining_cooldown/3600:.1f} more hours")
+                            time.sleep(min(300, remaining_cooldown))  # Sleep for 5 minutes or remaining time
+                            continue
+                        else:
+                            worker.in_cooldown = False
+                            logger.info(f"Worker {worker.worker_id}: Cooldown expired")
+                    
+                    # Check for session timeout
+                    if time.time() - last_profile_time > 1800:  # 30 minutes
+                        logger.info(f"Worker {worker.worker_id}: Refreshing session due to inactivity")
+                        loop.run_until_complete(worker.refresh_session())
+                        last_profile_time = time.time()
+                    
+                    # Get next profile URL
                     try:
                         profile_url = self.profile_queue.get(timeout=5)
+                        last_profile_time = time.time()
                     except queue.Empty:
-                        logger.info(f"Worker {worker.worker_id}: No more profiles in queue")
-                        break
+                        logger.debug(f"Worker {worker.worker_id}: Queue empty, waiting...")
+                        time.sleep(10)
+                        continue
                     
                     # Process the profile
                     logger.info(f"Worker {worker.worker_id}: Processing {profile_url}")
-                    profile_data = asyncio.get_event_loop().run_until_complete(worker.scrape_profile(profile_url))
+                    profile_data = loop.run_until_complete(worker.scrape_profile(profile_url))
                     
                     # Put result in results queue
                     self.results_queue.put({
@@ -1998,26 +2382,33 @@ class LinkedInMassProfileScraper:
                         'timestamp': datetime.now().isoformat()
                     })
                     
-                    # Mark task as done
                     self.profile_queue.task_done()
                     
-                    # Random delay between profiles
-                    delay = random.uniform(
-                        self.config.get('min_delay', 30),
-                        self.config.get('max_delay', 90)
-                    )
+                    # If scraping failed (likely due to blocks), increase delay
+                    if profile_data is None:
+                        delay = random.uniform(300, 600)  # 5-10 minutes if failed
+                        logger.warning(f"Worker {worker.worker_id}: Profile failed, extended wait of {delay:.1f}s")
+                    else:
+                        # Normal delay for successful scrapes
+                        delay = random.uniform(
+                            self.config.get('min_delay', 120),
+                            self.config.get('max_delay', 300)
+                        )
                     
                     logger.info(f"Worker {worker.worker_id}: Waiting {delay:.1f}s before next profile")
                     time.sleep(delay)
                     
                 except Exception as e:
                     logger.error(f"Worker {worker.worker_id}: Error processing profile: {e}")
-                    logger.debug(traceback.format_exc())
-                    time.sleep(5)  # Brief pause after error
+                    time.sleep(5)
         
         finally:
             # Clean up
-            asyncio.get_event_loop().run_until_complete(worker.cleanup())
+            try:
+                loop.run_until_complete(worker.cleanup())
+                loop.close()
+            except Exception as e:
+                logger.error(f"Worker {worker.worker_id}: Cleanup error: {e}")
                 
             with self.lock:
                 self.active_workers -= 1
@@ -2049,7 +2440,7 @@ class LinkedInMassProfileScraper:
                 logger.error(f"Error processing result: {e}")
     
     def _progress_monitor(self):
-        """Monitor and report progress"""
+        """Monitor progress"""
         while self.running or self.active_workers > 0:
             try:
                 with self.lock:
@@ -2060,13 +2451,7 @@ class LinkedInMassProfileScraper:
                 
                 logger.info(f"Progress: {processed} processed ({successful} successful), {remaining} remaining, {active} active workers")
                 
-                # Estimate completion time
-                if processed > 0 and remaining > 0:
-                    avg_worker_rate = processed / (sum(w.profiles_scraped for w in self.worker_pool) or 1)
-                    estimated_hours = (remaining / (active or 1)) / avg_worker_rate / 3600
-                    logger.info(f"Estimated completion time: {estimated_hours:.1f} hours")
-                
-                time.sleep(60)  # Update every minute
+                time.sleep(60)
                 
             except Exception as e:
                 logger.error(f"Error in progress monitor: {e}")
@@ -2113,6 +2498,9 @@ class LinkedInMassProfileScraper:
         with self.lock:
             logger.info(f"Final stats: {self.processed_profiles} processed, {self.successful_profiles} successful")
         
+        if self.file_watcher:
+            self.file_watcher.stop()
+
         # Save final stats
         self._save_progress_stats()
         
@@ -2143,13 +2531,14 @@ def main():
     
     # Configure the scraper
     config = {
-        'worker_count': args.workers,
+        'worker_count': 1,
         'credentials': credentials,
         'proxy_file': args.proxy_file,
         # 'headless': args.headless,
         'headless': False,
-        'min_delay': args.min_delay,
-        'max_delay': args.max_delay
+        'min_delay': 120,
+        'max_delay': 300,
+        'profile_file': args.profile_file
     }
     
     # Initialize the scraper
@@ -2166,4 +2555,4 @@ def main():
     scraper.start_scraping()
 
 if __name__ == "__main__":
-    main()
+    main()  
