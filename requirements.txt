@@ -1,0 +1,18 @@
+selenium
+webdriver-manager==4.0.0
+fake-useragent==1.2.1
+requests==2.31.0
+urllib3==2.0.7
+playwright==1.38.0 
+polars==0.19.3 
+asyncio==3.4.3
+# playwright install chromium
+sentence-transformers spacy
+"python -m spacy download en_core_web_sm"
+"python -m spacy download en_core_web_lg
+pip install pandas openpyxl"
+
+langgraph
+langchain
+langsmith
+ 
