@@ -8,9 +8,8 @@ import argparse
 import traceback
 import time
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
-import polars as pl
+from typing import Dict, Optional, Any
+from playwright.async_api import async_playwright
 import threading
 import queue
 import signal
@@ -21,6 +20,9 @@ import traceback
 from file_watcher import ProfileFileWatcher
 from helper import POSTS_SCRIPT, COMMENTS_SCRIPT, REACTIONS_SCRIPT, stealth_mode_script
 from database.db import *
+import requests
+import urllib.request
+import ssl
 
 # Set up logging
 logging.basicConfig(
@@ -81,8 +83,8 @@ class PlaywrightProfileScraper:
         self.page = None
         self.session_start_time = None
         self.profiles_scraped = 0
-        self.max_profiles_per_session = random.randint(5, 10)  # Randomize session limits
-        self.session_duration_limit = timedelta(hours=random.uniform(2, 4))  # Random session duration
+        self.max_profiles_per_session = random.randint(3, 5)  # Randomize session limits
+        self.session_duration_limit = timedelta(hours=random.uniform(1, 2))  # Random session duration
         
         # State tracking
         self.is_logged_in = False
@@ -138,28 +140,31 @@ class PlaywrightProfileScraper:
         return False
 
     def test_proxy(self, proxy_url):
-        """Test if a proxy is working"""
-        import requests
+        """Test proxy connection"""
         try:
-            proxies = {
-                'http': proxy_url,
-                'https': proxy_url
-            }
-            response = requests.get('https://httpbin.org/ip', proxies=proxies, timeout=10)
+            proxies = {'http': proxy_url, 'https': proxy_url}
+            response = requests.get(
+                'https://geo.brdtest.com/mygeo.json',
+                proxies=proxies,
+                timeout=20,
+                verify=False,
+                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            )
+            
             if response.status_code == 200:
-                logger.info(f"Proxy {proxy_url} is working")
+                geo_data = response.json()
+                logger.info(f"Worker {self.worker_id}: Proxy working - {geo_data.get('country')}")
                 return True
-        except Exception as e:
-            logger.warning(f"Proxy {proxy_url} failed test: {e}")
-        return False
+            return False
+            
+        except Exception:
+            return False
 
     async def initialize(self):
-        """Initialize Playwright browser, context, and optionally restore session via cookies."""
+        """Initialize Playwright browser with optimized proxy support."""
         try:
-            # Launch Playwright
             self.playwright = await async_playwright().start()
 
-            # Browser launch args
             browser_args = [
                 '--no-sandbox',
                 '--disable-blink-features=AutomationControlled',
@@ -167,120 +172,107 @@ class PlaywrightProfileScraper:
                 '--disable-features=VizDisplayCompositor'
             ]
 
+            # Parse and configure proxy
             proxy_config = None
             if self.proxy:
-                logger.info(f"Worker {self.worker_id}: Testing proxy {self.proxy}")
-                if self.test_proxy(self.proxy):
-                    # Configure proxy for Playwright
-                    if self.proxy.startswith('http://') or self.proxy.startswith('https://'):
-                        proxy_parts = self.proxy.replace('http://', '').replace('https://', '').split(':')
-                        if len(proxy_parts) >= 2:
-                            proxy_config = {
-                                'server': f"http://{proxy_parts[0]}:{proxy_parts[1]}"
-                            }
-                            # Add authentication if provided
-                            if len(proxy_parts) >= 4:
-                                proxy_config['username'] = proxy_parts[2]
-                                proxy_config['password'] = proxy_parts[3]
-                else:
-                    logger.warning(f"Worker {self.worker_id}: Proxy failed test, proceeding without proxy")
+                logger.info(f"Worker {self.worker_id}: Configuring proxy")
+                proxy_config = self._parse_proxy(self.proxy)
+                if not proxy_config:
+                    logger.warning(f"Worker {self.worker_id}: Invalid proxy format, proceeding without proxy")
                     self.proxy = None
 
+            # Launch browser with proxy
             self.browser = await self.playwright.chromium.launch(
                 headless=self.headless,
-                args=browser_args
+                args=browser_args,
+                proxy=proxy_config
             )
-            if not self.browser:
-                logger.error(f"Worker {self.worker_id}: Failed to launch browser.")
-                await self.cleanup()
-                return False
 
-            # Randomize viewport & UA
+            # Create context
             viewport = random.choice([
                 {'width': 1366, 'height': 768},
                 {'width': 1440, 'height': 900},
-                {'width': 1536, 'height': 864},
-                {'width': 1680, 'height': 1050},
                 {'width': 1920, 'height': 1080}
             ])
 
             with open("userAgents.json", "r") as ua:
-                user_agents = json.load(ua)
+                user_agent = random.choice(json.load(ua))
 
-            user_agent = random.choice(user_agents)
+            # Use Indian settings if proxy is configured
+            if proxy_config:
+                context_config = {
+                    'viewport': viewport,
+                    'user_agent': user_agent,
+                    'locale': "en-US",
+                    'timezone_id': "Asia/Kolkata",
+                    'geolocation': {"longitude": 77.209, "latitude": 28.613},
+                    'permissions': ["geolocation"],
+                    'extra_http_headers': {"Accept-Language": "en-US,en;q=0.9,hi;q=0.8"}
+                }
+            else:
+                context_config = {
+                    'viewport': viewport,
+                    'user_agent': user_agent,
+                    'locale': "en-US",
+                    'timezone_id': "America/New_York",
+                    'geolocation': {"longitude": -122.084, "latitude": 37.422},
+                    'permissions': ["geolocation"],
+                    'extra_http_headers': {"Accept-Language": "en-US,en;q=0.9"}
+                }
 
-            # Create context
-            self.context = await self.browser.new_context(
-                viewport=viewport,
-                user_agent=user_agent,
-                locale="en-US",
-                timezone_id=random.choice([
-                    "America/New_York", "Europe/London", "Asia/Tokyo"
-                ]),
-                geolocation={"longitude": -122.084, "latitude": 37.422},
-                permissions=["geolocation"],
-                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-            )
-            if not self.context:
-                logger.error(f"Worker {self.worker_id}: Failed to create browser context.")
-                await self.cleanup()
-                return False
-
-            # Stealth
+            self.context = await self.browser.new_context(**context_config)
             await self._apply_stealth_mode()
-
-            # New page
+            
             self.page = await self.context.new_page()
-            if not self.page:
-                logger.error(f"Worker {self.worker_id}: Failed to create browser page.")
-                await self.cleanup()
-                return False
-
             self.page.set_default_timeout(30000)
-            self.page.on("console", lambda msg: logger.debug(f"Browser console: {msg.text}"))
+            
             self._check_cooldown_state()
-
             if self.in_cooldown:
-                logger.info(f"Worker {self.worker_id}: In cooldown until {self.cooldown_until}")
                 return True
 
-            # --- Attempt to load cookies BEFORE any navigation ---
+            # Load cookies and check login status
             cookie_path = f"cookies_worker_{self.worker_id}.json"
             cookies_loaded = await self.load_cookies(self.context, cookie_path)
-
+            
             self.session_start_time = datetime.now()
             self.profiles_scraped = 0
 
-            # Always go to /feed and check login status
-            try:
-                await self.page.goto("https://www.linkedin.com/feed/", wait_until="networkidle")
-            except Exception as nav_ex:
-                logger.error(f"Worker {self.worker_id}: Couldn't reach feed page: {nav_ex}")
-                await self.cleanup()
-                return False
-
-            # Robust login/authwall check
+            await self.page.goto("https://www.linkedin.com/feed/", wait_until="networkidle")
+            
             if cookies_loaded and "feed" in self.page.url and not await self._is_authwall_present():
                 self.is_logged_in = True
-                logger.info(f"Worker {self.worker_id}: Session restored via cookies.")
+                logger.info(f"Worker {self.worker_id}: Session restored via cookies")
             else:
                 self.is_logged_in = False
-                logger.info(f"Worker {self.worker_id}: Not logged in, will perform fresh login.")
+                logger.info(f"Worker {self.worker_id}: Fresh login required")
 
             self.last_activity_time = datetime.now()
-            self._check_cooldown_state()
-
-            # Only start activity simulation if logged in and not in cooldown
+            
             if not self.in_cooldown and self.is_logged_in:
                 await self.start_activity_simulation()
 
-            return True  # So login() will run if not authenticated
+            return True
 
         except Exception as e:
             logger.error(f"Worker {self.worker_id}: Error initializing browser: {e}")
-            logger.debug(traceback.format_exc())
             await self.cleanup()
             return False
+
+    def _parse_proxy(self, proxy_string):
+        """Parse BrightData proxy format"""
+        try:
+            proxy_clean = proxy_string.replace('http://', '')
+            auth_part, server_part = proxy_clean.split('@', 1)
+            username, password = auth_part.split(':', 1)
+            server, port = server_part.rsplit(':', 1)
+            
+            return {
+                'server': f"http://{server}:{port}",
+                'username': username,
+                'password': password
+            }
+        except Exception:
+            return None
 
     async def _apply_stealth_mode(self):
         """Apply stealth mode to avoid detection"""
@@ -1414,52 +1406,10 @@ class PlaywrightProfileScraper:
             logger.error(f"Worker {self.worker_id}: Error extracting education section: {e}")
             return education
     
-    async def _extract_certifications(self):
-        """Extract certifications"""
-        certifications = []
-        
-        try:
-            # Find the certifications section
-            cert_section = await self.page.query_selector("section#certifications")
-            
-            if cert_section:
-                cert_items = await cert_section.query_selector_all(".pvs-list__item-container")
-                
-                for item in cert_items:
-                    try:
-                        cert = {}
-                        
-                        # Name
-                        name_elem = await item.query_selector(".t-bold span[aria-hidden='true']")
-                        if name_elem:
-                            cert['name'] = await name_elem.inner_text()
-                        
-                        # Issuer
-                        issuer_elem = await item.query_selector(".t-normal.t-black--light span[aria-hidden='true']")
-                        if issuer_elem:
-                            cert['issuer'] = await issuer_elem.inner_text()
-                        
-                        # Date
-                        date_elements = await item.query_selector_all(".t-normal.t-black--light span[aria-hidden='true']")
-                        if len(date_elements) > 1:
-                            cert['date'] = await date_elements[1].inner_text()
-                        
-                        certifications.append(cert)
-                        
-                    except Exception as ex:
-                        logger.error(f"Worker {self.worker_id}: Error extracting certification: {ex}")
-            
-            return certifications
-            
-        except Exception as e:
-            logger.error(f"Worker {self.worker_id}: Error extracting certifications: {e}")
-            return certifications
-
     async def scrape_user_activity(self, profile_url, last_post_time=None, last_comment_time=None, last_reaction_time=None):
         """
-        Scrapes a user's activity incrementally. It gets posts from the '/all' endpoint
-        and then navigates directly to the specific URLs for comments and reactions.
-        Returns both the activity_data dict and a new_times dict for state saving.
+        Scrapes a user's activity using realistic navigation instead of direct endpoints.
+        OPTIMIZED VERSION - Minimal changes to existing code structure.
         """
         logger.info(f"[STATE] {profile_url}: last_post_time={last_post_time}, last_comment_time={last_comment_time}, last_reaction_time={last_reaction_time}")
 
@@ -1475,108 +1425,132 @@ class PlaywrightProfileScraper:
             "last_reaction_time": last_reaction_time
         }
 
-        base_url = profile_url.rstrip('/')
-
         try:
-            # --- 1. Scrape Posts from the '/all' Activity View ---
-            all_activity_url = f"{base_url}/recent-activity/all/"
-            print(f"Navigating to the 'All' activity feed for posts: {all_activity_url}")
-            await self.page.goto(all_activity_url, wait_until="domcontentloaded")
-            await self.page.wait_for_timeout(3000)
+            # Ensure we're on the main profile page
+            if profile_url not in self.page.url:
+                await self.page.goto(profile_url, wait_until="domcontentloaded")
+                await self.page.wait_for_timeout(2000)
 
+            # --- STEP 1: Navigate to activity page naturally ---
+            logger.info("Looking for 'Show all posts' button")
+            
+            # Look for the "Show all posts" button
+            show_all_button = await self.page.query_selector('a[href*="recent-activity/all/"]')
+            if not show_all_button:
+                # Alternative selector
+                show_all_button = await self.page.query_selector('a.profile-creator-shared-content-view__footer-action')
+            
+            if show_all_button:
+                # Click the button naturally
+                await show_all_button.click()
+                await self.page.wait_for_timeout(3000)
+                logger.info("Clicked 'Show all posts' button")
+            else:
+                logger.warning("Could not find 'Show all posts' button - trying direct navigation")
+                # Fallback to direct navigation if button not found
+                all_activity_url = f"{profile_url.rstrip('/')}/recent-activity/all/"
+                await self.page.goto(all_activity_url, wait_until="domcontentloaded")
+                await self.page.wait_for_timeout(3000)
+
+            # --- STEP 2: Extract Posts (keep existing logic) ---
             no_activity = await self.page.query_selector(".pv-recent-activity-empty-container")
             if not no_activity:
-                posts, most_recent_post_time = await self._extract_posts(since_timestamp=last_post_time)
+                posts, most_recent_post_time = await self._extract_posts(since_timestamp=last_post_time, max_posts=5)
                 activity_data['posts'] = posts
                 if most_recent_post_time:
                     new_times["last_post_time"] = most_recent_post_time
             else:
                 logger.info("No activity found on the profile.")
 
-            # --- 2. Scrape Comments from its Direct URL ---
-            comments_url = f"{base_url}/recent-activity/comments/"
-            print(f"Navigating directly to Comments: {comments_url}")
-            await self.page.goto(comments_url, wait_until="domcontentloaded")
-            await self.page.wait_for_timeout(3000)
-
-            no_activity = await self.page.query_selector(".pv-recent-activity-empty-container")
-            if not no_activity:
-                comments, most_recent_comment_time = await self._extract_comments(since_timestamp=last_comment_time)
-                activity_data['comments'] = comments
-                if most_recent_comment_time:
-                    new_times["last_comment_time"] = most_recent_comment_time
+            # --- STEP 3: Navigate to Comments tab naturally ---
+            logger.info("Navigating to Comments tab")
+            
+            # Look for Comments tab button
+            comments_tab = await self.page.query_selector('button[id="content-collection-pill-1"]')
+            if not comments_tab:
+                # Alternative selector
+                comments_tab = await self.page.query_selector('button:has-text("Comments")')
+            
+            if comments_tab:
+                # Click Comments tab
+                await comments_tab.click()
+                await self.page.wait_for_timeout(3000)
+                logger.info("Clicked Comments tab")
+                
+                # Extract comments (keep existing logic)
+                no_activity = await self.page.query_selector(".pv-recent-activity-empty-container")
+                if not no_activity:
+                    comments, most_recent_comment_time = await self._extract_comments(since_timestamp=last_comment_time, max_comments=5)
+                    activity_data['comments'] = comments
+                    if most_recent_comment_time:
+                        new_times["last_comment_time"] = most_recent_comment_time
+                else:
+                    logger.info("No comment activity found.")
             else:
-                logger.info("No comment activity found.")
+                logger.warning("Could not find Comments tab")
 
-            # --- 3. Scrape Reactions from its Direct URL ---
-            reactions_url = f"{base_url}/recent-activity/reactions/"
-            print(f"Navigating directly to Reactions: {reactions_url}")
-            await self.page.goto(reactions_url, wait_until="domcontentloaded")
-            await self.page.wait_for_timeout(3000)
-
-            no_activity = await self.page.query_selector(".pv-recent-activity-empty-container")
-            if not no_activity:
-                reactions, most_recent_reaction_time = await self._extract_reactions(since_timestamp=last_reaction_time)
-                activity_data['reactions'] = reactions
-                if most_recent_reaction_time:
-                    new_times["last_reaction_time"] = most_recent_reaction_time
+            # --- STEP 4: Navigate to Reactions tab naturally ---
+            logger.info("Navigating to Reactions tab")
+            
+            # Look for Reactions tab button
+            reactions_tab = await self.page.query_selector('button[id="content-collection-pill-4"]')
+            if not reactions_tab:
+                # Alternative selector
+                reactions_tab = await self.page.query_selector('button:has-text("Reactions")')
+            
+            if reactions_tab:
+                # Click Reactions tab
+                await reactions_tab.click()
+                await self.page.wait_for_timeout(3000)
+                logger.info("Clicked Reactions tab")
+                
+                # Extract reactions (keep existing logic)
+                no_activity = await self.page.query_selector(".pv-recent-activity-empty-container")
+                if not no_activity:
+                    reactions, most_recent_reaction_time = await self._extract_reactions(since_timestamp=last_reaction_time, max_reactions=5)
+                    activity_data['reactions'] = reactions
+                    if most_recent_reaction_time:
+                        new_times["last_reaction_time"] = most_recent_reaction_time
+                else:
+                    logger.info("No reaction activity found.")
             else:
-                logger.info("No reaction activity found.")
+                logger.warning("Could not find Reactions tab")
 
-            print("Successfully completed all activity scraping.")
+            logger.info("Successfully completed activity scraping with natural navigation.")
             return activity_data, new_times
 
         except Exception as e:
             logger.error(f"A critical error occurred in scrape_user_activity: {e}")
             return activity_data, new_times
 
-    async def efficient_scroll_page(self, page, max_scrolls=20, scroll_pause=1, patience=3):
+    async def efficient_scroll_page(self):
         """
-        Scrolls the main page efficiently and patiently to ensure all activity cards are loaded.
-        Stops early if 0 cards are found for 'patience' consecutive scrolls.
-        This is the correct method for the 'Comments' activity feed.
+        Realistic scrolling specifically for activity pages
+        Replaces your existing efficient_scroll_page with more human-like behavior
         """
-        last_count = 0
-        stagnant_scrolls = 0
-        zero_scrolls = 0  # Tracks consecutive zero-card scrolls
-
-        print("🔁 Starting smart scroll of the main page to load all activity cards...")
-
-        for i in range(max_scrolls):
-            # 1. Count the number of loaded activity cards
-            current_count = await page.evaluate(
-                "document.querySelectorAll('ul.display-flex.flex-wrap.list-style-none.justify-center > li').length"
-            )
+        try:
+            # Scroll 2-4 times with realistic pauses
+            scroll_count = random.randint(2, 4)
             
-            print(f"Scroll {i+1}/{max_scrolls}: Found {current_count} cards (previously {last_count}).")
-
-            # Stop if 0 cards found for 'patience' consecutive scrolls
-            if current_count == 0:
-                zero_scrolls += 1
-                if zero_scrolls >= patience:
-                    print(f"No cards found for {patience} consecutive scrolls. Stopping scroll.")
-                    break
-            else:
-                zero_scrolls = 0
-
-            # Check if scrolling has stalled (no new cards loaded for 'patience' scrolls)
-            if current_count == last_count and last_count > 0:
-                stagnant_scrolls += 1
-                if stagnant_scrolls >= patience:
-                    print(f"No new cards loaded for {patience} consecutive scrolls. Assuming all are loaded.")
-                    break
-            else:
-                stagnant_scrolls = 0  # Reset if new content is found
-
-            last_count = current_count
-
-            # 3. Scroll to bottom
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-
-            # 4. Wait for new content to load
-            await asyncio.sleep(scroll_pause)
-
-        print(f"🏁 Finished scrolling. A total of {last_count} cards are loaded and ready for extraction.")
+            for i in range(scroll_count):
+                # Variable scroll distance
+                scroll_distance = random.randint(400, 800)
+                await self.page.evaluate(f"window.scrollBy(0, {scroll_distance})")
+                
+                # Human-like pause between scrolls
+                pause_time = random.uniform(1.5, 3.5)
+                await asyncio.sleep(pause_time)
+                
+                # Occasionally scroll back up a bit (human behavior)
+                if random.random() < 0.2:
+                    back_scroll = random.randint(100, 300)
+                    await self.page.evaluate(f"window.scrollBy(0, -{back_scroll})")
+                    await asyncio.sleep(random.uniform(1, 2))
+            
+            logger.info(f"Completed realistic scrolling with {scroll_count} scroll actions")
+            
+        except Exception as e:
+            logger.error(f"Error during realistic scrolling: {e}")
 
     def incremental_filter(self, data, since_timestamp, max_count):
         filtered = []
@@ -1604,7 +1578,7 @@ class PlaywrightProfileScraper:
             cutoff_date = datetime.now() - timedelta(days=days_back)
             since_timestamp = cutoff_date.isoformat()
 
-        await self.efficient_scroll_page(self.page)
+        await self.efficient_scroll_page()
         try:
             print(" Starting post extraction with all selectors...")
 
@@ -1617,7 +1591,6 @@ class PlaywrightProfileScraper:
 
             # --- Incremental filtering ---
             response = self.incremental_filter(posts_data,since_timestamp, max_posts)
-
             return response
         except Exception as e:
             logger.error(f"Error during universal post extraction: {e}")
@@ -1633,9 +1606,9 @@ class PlaywrightProfileScraper:
             cutoff_date = datetime.now() - timedelta(days=days_back)
             since_timestamp = cutoff_date.isoformat()
 
-        await self.efficient_scroll_page(self.page)
+        await self.efficient_scroll_page()
         try:
-            print("Starting high-performance comment extraction with all selectors...")
+            print("Starting comment extraction with all selectors...")
 
             extraction_script = COMMENTS_SCRIPT
 
@@ -1646,7 +1619,6 @@ class PlaywrightProfileScraper:
 
             # --- Incremental filtering ---
             response = self.incremental_filter(comments,since_timestamp, max_comments)
-
             return response
         except Exception as e:
             logger.error(f"Error during high-performance extraction: {e}")
@@ -1662,20 +1634,20 @@ class PlaywrightProfileScraper:
             cutoff_date = datetime.now() - timedelta(days=days_back)
             since_timestamp = cutoff_date.isoformat()
 
-        await self.efficient_scroll_page(self.page)
+        await self.efficient_scroll_page()
         try:
-            print("Starting high-performance reaction extraction with all selectors...")
+            print("Starting reaction extraction with all selectors...")
 
             extraction_script = REACTIONS_SCRIPT 
 
             reactions_data = await self.page.evaluate(extraction_script)
             if max_reactions is not None:
                 reactions_data = reactions_data[:max_reactions]
-            print(f"✅ Successfully extracted {len(reactions_data)} reactions with all selectors.")
+            print(f"Successfully extracted {len(reactions_data)} reactions with all selectors.")
 
             # --- Incremental filtering ---
             response = self.incremental_filter(reactions_data,since_timestamp, max_reactions)
-
+            return response
         except Exception as e:
             logger.error(f"Error during universal reaction extraction: {e}")
             return [], None
@@ -1828,8 +1800,19 @@ class PlaywrightProfileScraper:
                 conn.close()
     
     async def _human_sleep(self, min_seconds, max_seconds):
-        """Sleep for a random duration to mimic human behavior"""
+        """
+        Enhanced version of your existing _human_sleep method
+        Adds more realistic human-like pauses
+        """
+        # Base sleep time
         sleep_time = random.uniform(min_seconds, max_seconds)
+        
+        # Occasionally add longer pauses (simulating distractions)
+        if random.random() < 0.1:  # 10% chance
+            distraction_time = random.uniform(2, 8)
+            sleep_time += distraction_time
+            logger.debug(f"Worker {self.worker_id}: Added distraction pause of {distraction_time:.1f}s")
+        
         await asyncio.sleep(sleep_time)
     
     async def _human_type(self, selector, text):
