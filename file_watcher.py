@@ -3,7 +3,7 @@ import threading
 import time
 import logging
 import queue
-
+import csv
 
 logger = logging.getLogger("ProfileWatcher")
 logging.basicConfig(level=logging.INFO)
@@ -15,7 +15,7 @@ class ProfileFileWatcher:
         """Initialize the watcher"""
         self.file_path = file_path
         self.profile_queue = profile_queue
-        self.processed_urls = set()
+        self.loaded_urls = set()  # Changed from processed_urls to loaded_urls
         self.last_modified = 0
         self.running = False
         self.thread = None
@@ -61,36 +61,38 @@ class ProfileFileWatcher:
             if not os.path.exists(self.file_path):
                 logger.error(f"Profile file {self.file_path} does not exist")
                 return
-                
-            # Load state to get previously processed URLs
-            try:
-                from playwright_scrapper import load_state, save_state
-                state = load_state()
-                processed_urls = state.get("processed_urls", [])
-                
-                # Update the in-memory set with URLs from state
-                self.processed_urls.update(processed_urls)
-            except Exception as e:
-                logger.warning(f"Could not load state: {e}")
-                
-            with open(self.file_path, 'r') as f:
-                new_count = 0
-                for line in f:
-                    url = line.strip()
-                    if url and "/in/" in url and url not in self.processed_urls:
-                        self.profile_queue.put(url)
-                        self.processed_urls.add(url)
-                        new_count += 1
             
-            # Save processed URLs back to state
-            try:
-                state = load_state()  # Reload to avoid overwriting other changes
-                state["processed_urls"] = list(self.processed_urls)
-                save_state(state)
-            except Exception as e:
-                logger.warning(f"Could not save state: {e}")
+            new_count = 0
+            
+            # Check if it's a CSV file
+            if self.file_path.endswith('.csv'):
+                with open(self.file_path, 'r', encoding='utf-8') as f:
+                    csv_reader = csv.DictReader(f)
+                    
+                    for row in csv_reader:
+                        try:
+                            profile_url = row.get('profile_url', '').strip()
+                            
+                            # Validate URL
+                            if profile_url and "linkedin.com/in/" in profile_url and profile_url not in self.loaded_urls:
+                                # Create profile data dict
+                                profile_data = {
+                                    'first_name': row.get('first_name', '').strip(),
+                                    'last_name': row.get('last_name', '').strip(),
+                                    'company_name': row.get('company_name', '').strip(),
+                                    'profile_url': profile_url
+                                }
+                                
+                                self.profile_queue.put(profile_data)
+                                self.loaded_urls.add(profile_url)
+                                new_count += 1
+                                
+                        except Exception as e:
+                            logger.warning(f"Error processing CSV row: {e}")
+                            continue
             
             if new_count > 0:
                 logger.info(f"Added {new_count} new profiles to the queue")
+                
         except Exception as e:
             logger.error(f"Error loading new profiles: {e}")

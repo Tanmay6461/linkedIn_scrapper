@@ -1,1 +1,15 @@
-https://www.linkedin.com/in/caleb-jones-57415981
+Caleb,Jones,Berkadia,https://www.linkedin.com/in/caleb-jones-57415981
+Nick,Demerice,Intercity Transit,https://www.linkedin.com/in/nick-demerice-440b295
+Carrie,Cate,Ericsson,https://www.linkedin.com/in/carrie-cate
+Elyse,Most,Jamf,https://www.linkedin.com/in/elyse-most-0b89a342
+Mark,Martella,Federated Hermes,https://www.linkedin.com/in/markmartella
+Kevin,Bridges,Ibotta,https://www.linkedin.com/in/cyberswat
+Sean,Bangerter,GoDaddy,https://www.linkedin.com/in/sean-bangerter-92586766
+Ragini,Yalamanchali,Lincoln Financial Group,https://www.linkedin.com/in/ragini-yalamanchali-3385047
+Janine,Tilly,"Caleres, Inc.",https://www.linkedin.com/in/janine-tilly-9aabb24
+Duane,Morris,Scientific Drilling Intl Inc,https://www.linkedin.com/in/dumorris
+Vincent,Ng,Siemens,https://www.linkedin.com/in/vincent-ng-58539aa
+Marek,Gitrowski,Evoke,https://www.linkedin.com/in/marek-gitrowski-8569586
+Nizam,Akhtar,TeleWorld Solutions,https://www.linkedin.com/in/nizamakhtar
+Parag,Jain,PEGASYSTEMS,https://www.linkedin.com/in/singularitysi7
+Ian,Harker,BP,https://www.linkedin.com/in/ian-harker-m-b-a-c-p-m-b26a7a3

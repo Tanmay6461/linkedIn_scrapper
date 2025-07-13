@@ -59,7 +59,7 @@ class TestPlaywrightProfileScraper(unittest.TestCase):
         self.mock_page.locator.return_value.count = AsyncMock(return_value=1)
         
         # Import and create scraper
-        from playwright_scrapper import PlaywrightProfileScraper
+        from utils.playwright_scrapper import PlaywrightProfileScraper
         scraper = PlaywrightProfileScraper(worker_id=1, credentials=self.credentials)
         
         # Test initialization
@@ -69,7 +69,7 @@ class TestPlaywrightProfileScraper(unittest.TestCase):
         
     def test_extract_experience_parsing(self):
         """Test experience extraction from HTML"""
-        from playwright_scrapper import PlaywrightProfileScraper
+        from utils.playwright_scrapper import PlaywrightProfileScraper
         scraper = PlaywrightProfileScraper(worker_id=1, credentials=self.credentials)
         
         # Sample HTML with experience section
@@ -100,7 +100,7 @@ class TestPlaywrightProfileScraper(unittest.TestCase):
         
     def test_is_grouped_experience(self):
         """Test grouped experience detection"""
-        from playwright_scrapper import PlaywrightProfileScraper
+        from utils.playwright_scrapper import PlaywrightProfileScraper
         scraper = PlaywrightProfileScraper(worker_id=1, credentials=self.credentials)
         
         # Create mock HTML for grouped experience
@@ -127,7 +127,7 @@ class TestPlaywrightProfileScraper(unittest.TestCase):
         mock_exists.return_value = True
         mock_file.return_value.read.return_value = '{"test": "data"}'
         
-        from playwright_scrapper import load_state
+        from utils.playwright_scrapper import load_state
         state = load_state()
         self.assertEqual(state, {"test": "data"})
         
@@ -149,7 +149,7 @@ class TestPlaywrightProfileScraper(unittest.TestCase):
     @patch('playwright_scrapper.PlaywrightProfileScraper._human_sleep')
     async def test_scroll_page(self, mock_sleep):
         """Test page scrolling behavior"""
-        from playwright_scrapper import PlaywrightProfileScraper
+        from utils.playwright_scrapper import PlaywrightProfileScraper
         scraper = PlaywrightProfileScraper(worker_id=1, credentials=self.credentials)
         
         # Mock page
@@ -166,7 +166,7 @@ class TestPlaywrightProfileScraper(unittest.TestCase):
         
     def test_enter_cooldown(self):
         """Test cooldown functionality"""
-        from playwright_scrapper import PlaywrightProfileScraper
+        from utils.playwright_scrapper import PlaywrightProfileScraper
         scraper = PlaywrightProfileScraper(worker_id=1, credentials=self.credentials)
         
         # Enter cooldown
@@ -196,7 +196,7 @@ class TestLinkedInMassProfileScraper(unittest.TestCase):
     @patch('playwright_scrapper.PlaywrightProfileScraper')
     def test_init_workers(self, mock_scraper_class):
         """Test worker initialization"""
-        from playwright_scrapper import LinkedInMassProfileScraper
+        from utils.playwright_scrapper import LinkedInMassProfileScraper
         
         scraper = LinkedInMassProfileScraper(self.config)
         
@@ -206,7 +206,7 @@ class TestLinkedInMassProfileScraper(unittest.TestCase):
         
     def test_load_profile_urls_from_file(self):
         """Test loading URLs from file"""
-        from playwright_scrapper import LinkedInMassProfileScraper
+        from utils.playwright_scrapper import LinkedInMassProfileScraper
         
         # Create temp file with URLs
         with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
@@ -230,7 +230,7 @@ class TestLinkedInMassProfileScraper(unittest.TestCase):
             
     def test_load_profile_urls_from_list(self):
         """Test loading URLs from list"""
-        from playwright_scrapper import LinkedInMassProfileScraper
+        from utils.playwright_scrapper import LinkedInMassProfileScraper
         
         urls = [
             "https://linkedin.com/in/user1",
@@ -246,7 +246,7 @@ class TestLinkedInMassProfileScraper(unittest.TestCase):
     @patch('builtins.open', new_callable=mock_open)
     def test_save_progress_stats(self, mock_file):
         """Test progress statistics saving"""
-        from playwright_scrapper import LinkedInMassProfileScraper
+        from utils.playwright_scrapper import LinkedInMassProfileScraper
         
         scraper = LinkedInMassProfileScraper(self.config)
         scraper.processed_profiles = 10
@@ -268,7 +268,7 @@ class TestActivityExtraction(unittest.TestCase):
     @patch('playwright_scrapper.PlaywrightProfileScraper.efficient_scroll_page')
     async def test_extract_posts(self, mock_scroll):
         """Test post extraction"""
-        from playwright_scrapper import PlaywrightProfileScraper
+        from utils.playwright_scrapper import PlaywrightProfileScraper
         
         scraper = PlaywrightProfileScraper(worker_id=1, credentials=self.credentials)
         scraper.page = AsyncMock()
@@ -297,7 +297,7 @@ class TestActivityExtraction(unittest.TestCase):
     @patch('playwright_scrapper.PlaywrightProfileScraper.efficient_scroll_page')
     async def test_extract_comments(self, mock_scroll):
         """Test comment extraction"""
-        from playwright_scrapper import PlaywrightProfileScraper
+        from utils.playwright_scrapper import PlaywrightProfileScraper
         
         scraper = PlaywrightProfileScraper(worker_id=1, credentials=self.credentials)
         scraper.page = AsyncMock()
@@ -328,7 +328,7 @@ class TestIntegration(unittest.TestCase):
     @patch('playwright_scrapper.ProfileFileWatcher')
     async def test_full_scraping_flow(self, mock_watcher, mock_playwright):
         """Test complete scraping flow without actual login"""
-        from playwright_scrapper import LinkedInMassProfileScraper, PlaywrightProfileScraper
+        from utils.playwright_scrapper import LinkedInMassProfileScraper, PlaywrightProfileScraper
         
         # Setup config
         config = {

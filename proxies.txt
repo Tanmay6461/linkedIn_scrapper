@@ -1,1 +1,1 @@
-http://brd-customer-hl_6161f62b-zone-rp-country-us-session-1:c6d33xl6hnuh@brd.superproxy.io:33335
+http://brd-customer-hl_6161f62b-zone-residential1-country-us-city-boston-session-1:kli3x1nj6ecc@brd.superproxy.io:33335
