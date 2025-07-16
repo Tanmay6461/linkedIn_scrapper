@@ -23,6 +23,7 @@ from database.db import *
 import requests
 import csv 
 from difflib import SequenceMatcher
+from state_management import DatabaseStateManager
 
 # Set up logging
 logging.basicConfig(
@@ -86,6 +87,12 @@ class PlaywrightProfileScraper:
         self.max_profiles_per_session = random.randint(3, 5)  # Randomize session limits
         self.session_duration_limit = timedelta(hours=random.uniform(1, 2))  # Random session duration
         
+        self.db_state = DatabaseStateManager()
+        self.session_id = None
+        self.session_duration_limit = timedelta(hours=random.uniform(1, 2))
+
+
+
         # State tracking
         self.is_logged_in = False
         self.in_cooldown = False
@@ -163,6 +170,18 @@ class PlaywrightProfileScraper:
     async def initialize(self):
         """Initialize Playwright browser with optimized proxy support."""
         try:
+
+            # Create new session in database
+            self.session_id = self.db_state.create_session(self.worker_id)
+            
+            # Check if worker is in cooldown from database
+            in_cooldown, cooldown_until = self.db_state.get_worker_cooldown(self.worker_id)
+            if in_cooldown and cooldown_until and datetime.now() < cooldown_until:
+                self.in_cooldown = True
+                self.cooldown_until = cooldown_until
+                logger.info(f"Worker {self.worker_id}: In cooldown until {cooldown_until}")
+                return True  # Return True but worker won't process
+
             self.playwright = await async_playwright().start()
 
             browser_args = [
@@ -626,19 +645,31 @@ class PlaywrightProfileScraper:
     async def scrape_profile(self, profile_data):
         """Scrape a LinkedIn profile with robust error handling and processed URL tracking"""
 
-        if isinstance(profile_data, str):
-            # Handle old format (just URL)
-            profile_url = profile_data
-            first_name = ''
-            last_name = ''
-            company_name = ''
-            logger.warning(f"Worker {self.worker_id}: Using old URL format")
-        else:
-            # Handle new format (dict with names)
-            profile_url = profile_data.get('profile_url', '')
-            first_name = profile_data.get('first_name', '')
-            last_name = profile_data.get('last_name', '')
-            company_name = profile_data.get('company_name', '')
+        # Handle new format (dict with names)
+        profile_url = profile_data.get('profile_url', '')
+        first_name = profile_data.get('first_name', '')
+        last_name = profile_data.get('last_name', '')
+        company_name = profile_data.get('company_name', '')
+        location = profile_data.get('lcoation', '')
+
+
+        if self.db_state.is_processed(profile_url):
+            logger.info(f"Worker {self.worker_id}: Profile {profile_url} already processed (from DB), skipping.")
+            return None
+
+        # Check session and daily limits
+        can_continue, reason, limit = self.db_state.should_worker_continue(self.worker_id, self.session_id)
+        if not can_continue:
+            if reason == "session_limit_reached":
+                logger.info(f"Worker {self.worker_id}: Session limit reached ({limit} profiles)")
+                self._enter_cooldown(hours=1)  # Take a break
+            elif reason == "daily_limit_reached":
+                logger.warning(f"Worker {self.worker_id}: Daily limit reached ({limit} profiles)")
+                # Calculate hours until next day
+                tomorrow = datetime.now().replace(hour=6, minute=0, second=0) + timedelta(days=1)
+                hours_until_tomorrow = (tomorrow - datetime.now()).total_seconds() / 3600
+                self._enter_cooldown(hours=hours_until_tomorrow)
+            return None    
 
         if not self.session_start_time:
             self.session_start_time = datetime.now()
@@ -681,9 +712,9 @@ class PlaywrightProfileScraper:
 
         # Get previous scraping state for this profile
         profile_state = state.get(profile_url, {})
-        last_post_time = profile_state.get("last_post_time")
-        last_comment_time = profile_state.get("last_comment_time")
-        last_reaction_time = profile_state.get("last_reaction_time")
+        # last_post_time = profile_state.get("last_post_time")
+        # last_comment_time = profile_state.get("last_comment_time")
+        # last_reaction_time = profile_state.get("last_reaction_time")
 
         # Initialize profile data structure
         scraped_data = {
@@ -700,9 +731,7 @@ class PlaywrightProfileScraper:
         
             if first_name and last_name and company_name:
                 logger.info(f"Worker {self.worker_id}: Using secure feed search for {first_name} {last_name}")
-                navigation_success = await self.navigate_to_profile_by_search(
-                    profile_url, first_name, last_name, company_name
-                )
+                navigation_success = await self.navigate_to_profile_by_search(profile_url, first_name, last_name, company_name, location)
             else:
                 logger.warning(f"Worker {self.worker_id}: Missing name/company data, using direct navigation")
                 navigation_success = await self._navigate_direct_with_referrer(profile_url)
@@ -738,44 +767,35 @@ class PlaywrightProfileScraper:
             # Extract activity data if configured
             if self.config.get('scrape_activity', False):
                 logger.info(f"Worker {self.worker_id}: Extracting activity data")
-                activity_data, new_times = await self.scrape_user_activity(
-                    profile_url,
-                    last_post_time,
-                    last_comment_time,
-                    last_reaction_time
-                )
+
+                activity_data, new_times = await self.scrape_user_activity(profile_url)
                 scraped_data['activity'] = activity_data
 
-                # Save the latest timestamps for incremental scraping
-                # Re-load state to avoid race conditions
-                state = load_state()
-                state[profile_url] = new_times
-                save_state(state)
-
-            # Increment the profile count
-            self.profiles_scraped += 1
-
-            # Save the profile data to database
             try:
                 self._save_profile_data(scraped_data)
             except Exception as e:
                 logger.error(f"Worker {self.worker_id}: Failed to save profile data: {e}")
                 return None
 
-            # Only mark as processed if we reach this point (everything succeeded)
-            # Re-load state to avoid race conditions
-            state = load_state()
-            if "processed_urls" not in state:
-                state["processed_urls"] = []
-            if profile_url not in state["processed_urls"]:
-                state["processed_urls"].append(profile_url)
-                save_state(state)
-                logger.info(f"Worker {self.worker_id}: Successfully scraped and marked as processed: {profile_url}")
+            # Mark as processed in database
+            self.db_state.mark_processed(profile_url, self.worker_id, self.session_id, 'completed')
             
+            # Update counts in database
+            self.db_state.increment_counts(self.worker_id, self.session_id, success=True)
+            
+            # Increment local counter
+            self.profiles_scraped += 1
+            
+            logger.info(f"Worker {self.worker_id}: Successfully scraped: {profile_url}")
             return scraped_data
         except Exception as e:
             logger.error(f"Worker {self.worker_id}: Error scraping profile {profile_url}: {e}")
             logger.debug(traceback.format_exc())
+            
+            # Mark as failed in database
+            self.db_state.mark_processed(profile_url, self.worker_id, self.session_id, 'failed')
+            self.db_state.increment_counts(self.worker_id, self.session_id, success=False)
+            
             return None
 
     async def _handle_sign_in_wall(self):
@@ -911,26 +931,15 @@ class PlaywrightProfileScraper:
             return False
         
     def _enter_cooldown(self, hours=None):
-        """
-        Enter a cooldown period to avoid detection
-        Optionally specify cooldown duration in hours, otherwise uses random default
-        """
+        """Enter cooldown with database persistence"""
         if hours is None:
             hours = random.uniform(2, 4)
         
         self.cooldown_until = datetime.now() + timedelta(hours=hours)
         self.in_cooldown = True
         
-        # Save the cooldown state to persist across restarts
-        try:
-            state = load_state()
-            state[f"worker_{self.worker_id}_cooldown"] = {
-                "in_cooldown": True,
-                "cooldown_until": self.cooldown_until.isoformat()
-            }
-            save_state(state)
-        except Exception as e:
-            logger.error(f"Worker {self.worker_id}: Failed to save cooldown state: {e}")
+        # Save to database
+        self.db_state.set_worker_cooldown(self.worker_id, hours)
         
         logger.warning(f"Worker {self.worker_id}: Entering cooldown until {self.cooldown_until}")
 
@@ -1140,9 +1149,6 @@ class PlaywrightProfileScraper:
             logger.error(f"Worker {self.worker_id}: A critical error occurred in _extract_basic_info: {e}")
             return basic_info
 
-    def safe_get_text(self, soup_elem):
-        return soup_elem.get_text(strip=True) if soup_elem else None
-       
     def _is_grouped_experience(self, top_li):
         """Check if this is a grouped experience (multiple roles at same company)"""
         # Look for nested ul elements that contain multiple li items (roles)
@@ -1558,13 +1564,18 @@ class PlaywrightProfileScraper:
                     // Find the "Show all posts" or "Show all activity" link
                     const links = Array.from(document.querySelectorAll('a'));
                     const activityLink = links.find(link => {
-                        const text = link.textContent.toLowerCase();
-                        const href = link.href || '';
-                        return (text.includes('show all posts') || 
-                                text.includes('show all activity')) && 
-                            href.includes('recent-activity');
+                    const text = link.textContent.trim().toLowerCase();
+                    const href = link.href || '';
+                    // Accept *any* of: posts / activity / comments / reactions
+                    const match =
+                        text.includes('show all activity') ||
+                        text.includes('show all posts') ||
+                        text.includes('show all comments') ||
+                        text.includes('show all reactions') ||
+                        href.includes('recent-activity');
+                    return match;
                     });
-                    
+                                        
                     if (activityLink) {
                         activityLink.scrollIntoView({ behavior: 'smooth', block: 'center' });
                         activityLink.click();
@@ -2052,14 +2063,14 @@ class PlaywrightProfileScraper:
             logger.error(f"Worker {self.worker_id}: Error in direct navigation: {e}")
             return False
 
-    async def navigate_to_profile_by_search(self, profile_url: str, first_name: str, last_name: str, company_name: str):
+    async def navigate_to_profile_by_search(self, profile_url: str, first_name: str, last_name: str, company_name: str, location:str,):
         """Navigate to profile using LinkedIn feed search - most natural method"""
         try:
-            full_name = f"{first_name} {last_name}".strip()
-            logger.info(f"Worker {self.worker_id}: Starting feed search for '{full_name}' at '{company_name}'")
+            # full_name = f"{first_name} {last_name}".strip()
+            # logger.info(f"Worker {self.worker_id}: Starting feed search for '{full_name}' at '{company_name}'")
             
             # Use LinkedIn Feed Search
-            search_success = await self._search_linkedin_people(full_name, company_name, profile_url)
+            search_success = await self._search_linkedin_people(first_name, last_name, company_name, location, profile_url)
             
             if search_success:
                 logger.info(f"Worker {self.worker_id}: Successfully found profile via feed search")
@@ -2073,40 +2084,31 @@ class PlaywrightProfileScraper:
             logger.error(f"Worker {self.worker_id}: Error in feed search navigation: {e}")
             return False
         
-    async def _quick_feed_scroll(self):
-        """Quick scroll through feed to look natural"""
-        try:
-            # Scroll 1-2 times to look like we're browsing
-            scroll_count = random.randint(1, 2)
-            for _ in range(scroll_count):
-                scroll_distance = random.randint(200, 500)
-                await self.page.evaluate(f"window.scrollBy(0, {scroll_distance})")
-                await self._human_sleep(1, 2)
-        except Exception as e:
-            logger.debug(f"Worker {self.worker_id}: Quick feed scroll failed: {e}")
-
     async def _ensure_people_filter(self):
         """Ensure we're on the People filter in search results"""
         try:
-            # Look for People filter button
-            people_filter = await self.page.query_selector("button[aria-label*='People'], button:has-text('People')")
-            if not people_filter:
-                # Try alternative selector
-                people_filter = await self.page.query_selector(".search-reusables__filter-pill-button:has-text('People')")
+            # Skip if already on people search
+            if "/search/results/people/" in self.page.url:
+                return
             
-            if people_filter:
-                # Check if it's already selected
-                is_selected = await people_filter.evaluate("el => el.getAttribute('aria-pressed') === 'true' || el.classList.contains('selected')")
-                
-                if not is_selected:
-                    logger.info(f"Worker {self.worker_id}: Clicking People filter")
-                    await people_filter.click()
-                    await self._human_sleep(2, 4)
-            else:
-                logger.debug(f"Worker {self.worker_id}: People filter not found or already selected")
+            # Find People filter button
+            people_filter = await self.page.query_selector(
+                "button[aria-label*='People'], button:has-text('People')"
+            )
+            
+            if not people_filter:
+                return
+            
+            # Check if already selected
+            is_selected = await people_filter.evaluate(
+                "el => el.getAttribute('aria-pressed') === 'true' || el.classList.contains('search-reusables__filter-pill-button--selected')"
+            )
+            if not is_selected:
+                await people_filter.click()
+                await self._human_sleep(2, 3)
                 
         except Exception as e:
-            logger.debug(f"Worker {self.worker_id}: Error ensuring people filter: {e}")
+            logger.debug(f"Worker {self.worker_id}: Error with people filter: {e}")
 
     def _extract_profile_id(self, profile_url):
         """Extract the profile ID from a LinkedIn URL"""
@@ -2119,124 +2121,144 @@ class PlaywrightProfileScraper:
             return match.group(1).strip()
         return None
 
-    async def _search_linkedin_people(self, full_name: str, company_name: str, target_url: str):
-        """Search using the global search box available on every page"""
-        try:
-            # The search box should be available on every LinkedIn page after login
-            search_box = await self.page.query_selector("input.search-global-typeahead__input")
-            if not search_box:
-                search_box = await self.page.query_selector("input[placeholder='Search']")
-            if not search_box:
-                search_box = await self.page.query_selector(".search-global-typeahead input")
-            
-            if not search_box:
-                logger.error(f"Worker {self.worker_id}: Could not find search box on page: {self.page.url}")
-                return False
-            
-            # Clear and type new search query
-            search_query = f"{full_name} {company_name}"
-            logger.info(f"Worker {self.worker_id}: Searching for: '{search_query}'")
-            
-            # Click on search box
-            await search_box.click()
-            await self._human_sleep(0.3, 0.5)
-            
-            # Clear existing text - use triple click properly in Python
-            await search_box.click(click_count=3)  # This is the correct syntax
-            await self.page.keyboard.press("Delete")
-            await self._human_sleep(0.3, 0.5)
-            
-            # Type the search query naturally
-            for char in search_query:
-                await search_box.type(char)
-                await asyncio.sleep(random.uniform(0.05, 0.15))
-            
-            await self._human_sleep(1, 2)
-            
-            # Press Enter to search
-            await self.page.keyboard.press("Enter")
-            await self._human_sleep(3, 5)
-            
-            # Wait for search results to load
-            try:
-                await self.page.wait_for_selector(
-                    ".search-results-container, .reusable-search__result-container, .scaffold-layout__list-container", 
-                    timeout=10000
-                )
-                logger.info(f"Worker {self.worker_id}: Search results loaded")
-            except:
-                logger.warning(f"Worker {self.worker_id}: No search results found")
-                return False
-            
-            # Ensure People filter is selected
-            await self._ensure_people_filter()
-            await self._human_sleep(2, 3)
-            
-            # Extract target profile ID
-            target_profile_id = self._extract_profile_id(target_url)
-            if not target_profile_id:
-                return False
-            
-            logger.info(f"Worker {self.worker_id}: Looking for profile ID: {target_profile_id}")
-            
-            # Get profile links and find the target
-            profile_links = await self.page.evaluate("""
-                () => {
-                    const allLinks = Array.from(document.querySelectorAll('a'));
-                    const profileMap = new Map();
-                    
-                    allLinks.forEach(link => {
-                        if (!link.offsetParent) return;
-                        
-                        const href = link.href;
-                        if (href && href.includes('linkedin.com/in/')) {
-                            const match = href.match(/\/in\/([^/?]+)/);
-                            
-                            if (match) {
-                                const profileId = match[1];
-                                if (!profileMap.has(profileId)) {
-                                    profileMap.set(profileId, {
-                                        href: href,
-                                        profileId: profileId,
-                                        text: link.textContent.trim()
-                                    });
-                                }
-                            }
-                        }
-                    });
-                    
-                    return Array.from(profileMap.values());
-                }
-            """)
-            
-            logger.info(f"Worker {self.worker_id}: Found {len(profile_links)} unique profiles")
-            
-            # Find and click the matching profile
-            for profile in profile_links:
-                if profile['profileId'] == target_profile_id:
-                    logger.info(f"Worker {self.worker_id}: Found target profile!")
-                    
-                    link_element = await self.page.query_selector(f'a[href*="/in/{target_profile_id}"]')
-                    
-                    if link_element and await link_element.is_visible():
-                        await link_element.scroll_into_view_if_needed()
-                        await self._human_sleep(1, 2)
-                        
-                        await link_element.click()
-                        await self._human_sleep(3, 5)
-                        
-                        if target_profile_id in self.page.url:
-                            logger.info(f"Worker {self.worker_id}: Successfully navigated to profile")
-                            return True
-            
-            logger.warning(f"Worker {self.worker_id}: Profile not found in search results")
+    async def _search_linkedin_people(self, first_name: str, last_name: str, company_name: str, location: str, target_url: str):
+        """
+        Optimized search with anti-blocking measures.
+        1. Try: Full name + Company
+        2. Try: Full name + Location
+        3. Record failure (no direct navigation)
+        """
+        profile_id = self._extract_profile_id(target_url)
+        if not profile_id:
             return False
+        
+        full_name = f"{first_name} {last_name}".strip()
+        if not full_name:
+            if hasattr(self, 'db_state'):
+                self.db_state.record_failed_search(
+                    {'profile_url': target_url, 'first_name': first_name, 
+                    'last_name': last_name, 'company_name': company_name, 'location': location},
+                    failure_reason="no_name_provided",
+                    worker_id=self.worker_id,
+                    session_id=getattr(self, 'session_id', None)
+                )
+            return False
+        
+        # Build queries
+        queries = []
+        if company_name:
+            queries.append(f"{full_name} {company_name}")
+        if location:
+            queries.append(f"{full_name} {location}")
+        if not queries:
+            queries.append(full_name)
+        
+        # Search phase with human-like behavior
+        for attempt, query in enumerate(queries):
+            logger.info(f"Worker {self.worker_id}: Search {attempt + 1}: '{query}'")
             
-        except Exception as e:
-            logger.error(f"Worker {self.worker_id}: Search error: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return False        
+            try:
+                # Find search box
+                search_box = await self.page.query_selector(
+                    "input.search-global-typeahead__input, input[placeholder='Search']"
+                )
+                if not search_box:
+                    break
+                
+                # Human-like interaction with search box
+                await search_box.click()
+                await self._human_sleep(0.5, 1)  # Pause after click
+                
+                # Clear with triple-click (more natural than select all)
+                await search_box.click(click_count=3)
+                await self._human_sleep(0.3, 0.6)
+                await self.page.keyboard.press("Delete")
+                await self._human_sleep(0.3, 0.6)
+                
+                # Type with variable speed (important for avoiding detection)
+                for char in query:
+                    await search_box.type(char)
+                    # Variable typing speed - faster for spaces, slower for characters
+                    if char == ' ':
+                        await asyncio.sleep(random.uniform(0.05, 0.1))
+                    else:
+                        await asyncio.sleep(random.uniform(0.08, 0.15))
+                
+                # Pause before searching (like reading what you typed)
+                await self._human_sleep(1, 2)
+                
+                # Press Enter
+                await self.page.keyboard.press("Enter")
+                
+                # Wait for results with realistic timing
+                await self._human_sleep(3, 5)
+                
+                # Wait for results container
+                try:
+                    await self.page.wait_for_selector(
+                        ".search-results-container, .reusable-search__result-container",
+                        timeout=10000
+                    )
+                except:
+                    logger.debug(f"Worker {self.worker_id}: No results for '{query}'")
+                    continue
+                
+                # Ensure people filter
+                await self._ensure_people_filter()
+                
+                # Important: Wait after filter to let results update
+                await self._human_sleep(2, 3)
+                
+                # Small scroll to trigger any lazy loading
+                await self.page.evaluate("window.scrollBy(0, 200)")
+                await self._human_sleep(1, 1.5)
+                
+                # Look for specific profile
+                link_element = await self.page.query_selector(f'a[href*="/in/{profile_id}"]')
+                if link_element and await link_element.is_visible():
+                    # Scroll to element naturally
+                    await link_element.scroll_into_view_if_needed()
+                    await self._human_sleep(1, 2)
+                    
+                    # Hover before clicking (human behavior)
+                    await link_element.hover()
+                    await self._human_sleep(0.5, 1)
+                    
+                    # Try to click
+                    try:
+                        await link_element.click(timeout=5000)
+                    except:
+                        logger.debug(f"Worker {self.worker_id}: Normal click failed, using force click")
+                        await link_element.click(force=True)
+                    
+                    # Wait for navigation
+                    await self._human_sleep(3, 5)
+                    
+                    # Verify navigation succeeded
+                    if profile_id in self.page.url:
+                        logger.info(f"Worker {self.worker_id}: Successfully navigated to profile")
+                        return True
+                        
+            except Exception as e:
+                logger.debug(f"Worker {self.worker_id}: Search attempt {attempt + 1} error: {e}")
+                # Add delay between failed attempts
+                if attempt < len(queries) - 1:
+                    await self._human_sleep(2, 4)
+                continue
+        
+        # Record failure
+        logger.warning(f"Worker {self.worker_id}: Search failed for {target_url}")
+        if hasattr(self, 'db_state'):
+            self.db_state.record_failed_search(
+                {'profile_url': target_url, 'first_name': first_name,
+                'last_name': last_name, 'company_name': company_name, 'location': location},
+                failure_reason="search_not_found",
+                worker_id=self.worker_id,
+                session_id=getattr(self, 'session_id', None)
+            )
+        
+        return False        
+        
 class LinkedInProfileScraper:
     """Distributed scraper for handling thousands of LinkedIn profiles"""
     
@@ -2252,6 +2274,10 @@ class LinkedInProfileScraper:
         self.running = False
         self.lock = threading.Lock()
         self.shutdown_event = threading.Event()
+
+        self.db_state = DatabaseStateManager()
+        self.profiles_list = []
+
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
 
@@ -2261,17 +2287,11 @@ class LinkedInProfileScraper:
         
         # Load proxy list if provided
         self.proxies = self._load_proxies(config.get('proxy_file'))
-        
-        # Initialize event loop for each worker
-        # self.loop = asyncio.new_event_loop()
-        # asyncio.set_event_loop(self.loop)
-        
-        # Initialize workers
         self._init_workers()
         
-        # Register signal handlers for graceful shutdown
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        # # Register signal handlers for graceful shutdown
+        # signal.signal(signal.SIGINT, self._signal_handler)
+        # signal.signal(signal.SIGTERM, self._signal_handler)
     
     def _load_proxies(self, proxy_file):
         """Load proxies from a file if provided"""
@@ -2317,79 +2337,189 @@ class LinkedInProfileScraper:
             self.worker_pool.append(worker)
     
     def load_profile_urls(self, source):
-        """Load profile URLs from CSV file with names and companies"""
+        """Load profile URLs with detailed debugging"""
         try:
+            self.profiles_list = []
+            
+            # Check if file exists
+            if not os.path.exists(source):
+                logger.error(f"File not found: {source}")
+                return
+            
+            # Check file size
+            file_size = os.path.getsize(source)
+            logger.info(f"Loading file: {source} (size: {file_size} bytes)")
+            
             if isinstance(source, str) and source.endswith('.csv'):
                 # Load from CSV file
-                profiles = []
                 with open(source, 'r', encoding='utf-8') as f:
-                    csv_reader = csv.DictReader(f)
+                    # Read first few lines to debug
+                    f.seek(0)
+                    first_lines = f.readlines()[:5]
+                    logger.info(f"First 5 lines of CSV:")
+                    for i, line in enumerate(first_lines):
+                        logger.info(f"Line {i}: {line.strip()}")
                     
+                    # Reset file pointer
+                    f.seek(0)
+                    
+                    # Try to detect delimiter
+                    import csv
+                    sample = f.read(1024)
+                    f.seek(0)
+                    sniffer = csv.Sniffer()
+                    try:
+                        delimiter = sniffer.sniff(sample).delimiter
+                        logger.info(f"Detected delimiter: '{delimiter}'")
+                    except:
+                        delimiter = ','
+                        logger.info("Using default delimiter: ','")
+                    
+                    # Read CSV
+                    f.seek(0)
+                    csv_reader = csv.DictReader(f, delimiter=delimiter)
+                    
+                    # Print headers
+                    logger.info(f"CSV Headers: {csv_reader.fieldnames}")
+                    
+                    row_count = 0
                     for row in csv_reader:
+                        row_count += 1
+                        
+                        # Debug first few rows
+                        if row_count <= 3:
+                            logger.info(f"Row {row_count}: {row}")
+                        
                         try:
+                            # Try different possible column names
+                            profile_url = None
+                            first_name = None
+                            last_name = None
+                            company_name = None
+                            location = None
+                            
+                            # Check for profile URL in different possible column names
+                            url_columns = ['profile_url', 'linkedin_url', 'url', 'LinkedIn URL', 'Profile URL', 'linkedin', 'LinkedIn']
+                            for col in url_columns:
+                                if col in row and row[col]:
+                                    profile_url = row[col].strip()
+                                    break
+                            
+                            # Check for first name
+                            first_columns = ['first_name', 'First Name', 'firstname', 'FirstName', 'first', 'First']
+                            for col in first_columns:
+                                if col in row and row[col]:
+                                    first_name = row[col].strip()
+                                    break
+                            
+                            # Check for last name
+                            last_columns = ['last_name', 'Last Name', 'lastname', 'LastName', 'last', 'Last']
+                            for col in last_columns:
+                                if col in row and row[col]:
+                                    last_name = row[col].strip()
+                                    break
+                            
+                            # Check for company
+                            company_columns = ['company_name', 'Company Name', 'company', 'Company', 'organization', 'Organization']
+                            for col in company_columns:
+                                if col in row and row[col]:
+                                    company_name = row[col].strip()
+                                    break
+                            
+                            # company_columns = ['company_name', 'Company Name', 'company', 'Company', 'organization', 'Organization']
+                            for loc in 'location':
+                                if loc in row and row[loc]:
+                                    location = row[loc].strip()
+                                    break
+                            
+                            # If no URL found in designated columns, check all columns for LinkedIn URLs
+                            if not profile_url:
+                                for key, value in row.items():
+                                    if value and 'linkedin.com/in/' in str(value):
+                                        profile_url = value.strip()
+                                        logger.info(f"Found LinkedIn URL in column '{key}': {profile_url}")
+                                        break
+                            
                             profile_data = {
-                                'first_name': row.get('first_name', '').strip(),
-                                'last_name': row.get('last_name', '').strip(),
-                                'company_name': row.get('company_name', '').strip(),
-                                'profile_url': row.get('profile_url', '').strip()
+                                'first_name': first_name or '',
+                                'last_name': last_name or '',
+                                'company_name': company_name or '',
+                                'profile_url': profile_url or '',
+                                'location': location or ''
                             }
                             
-                            # Validate that we have required data
+                            # Validate that we have a LinkedIn URL
                             if profile_data['profile_url'] and "/in/" in profile_data['profile_url']:
-                                profiles.append(profile_data)
+                                self.profiles_list.append(profile_data)
+                                if len(self.profiles_list) <= 3:
+                                    logger.info(f"Added profile: {profile_data}")
+                            else:
+                                if row_count <= 5:
+                                    logger.warning(f"Row {row_count} skipped - no valid LinkedIn URL found")
                                 
                         except Exception as e:
-                            logger.warning(f"Error processing CSV row: {e}")
+                            logger.warning(f"Error processing row {row_count}: {e}")
                             continue
-                
-                # Add profiles to queue
-                for profile_data in profiles:
-                    self.profile_queue.put(profile_data)
-                
-                logger.info(f"Loaded {len(profiles)} profiles from CSV: {source}")
-                
+                    
+                    logger.info(f"Total rows processed: {row_count}")
+                    logger.info(f"Valid profiles found: {len(self.profiles_list)}")
+            
             elif isinstance(source, str) and os.path.isfile(source):
-                logger.warning("Old format detected. For secure navigation, use CSV format with names and companies.")
+                # Handle plain text file with URLs
+                logger.info("Processing as plain text file with URLs")
                 with open(source, 'r') as f:
-                    count = 0
+                    line_count = 0
                     for line in f:
+                        line_count += 1
                         url = line.strip()
                         if url and "/in/" in url:
-                            # Create minimal profile data
                             profile_data = {
                                 'first_name': '',
                                 'last_name': '',
                                 'company_name': '',
                                 'profile_url': url
                             }
-                            self.profile_queue.put(profile_data)
-                            count += 1
-                
-                logger.info(f"Loaded {count} profile URLs from {source}")
-                
-            elif isinstance(source, list):
-                # Handle list input
-                count = 0
-                for item in source:
-                    if isinstance(item, dict):
-                        if item.get('profile_url') and "/in/" in item['profile_url']:
-                            self.profile_queue.put(item)
-                            count += 1
-                    elif isinstance(item, str) and "/in/" in item:
-                        profile_data = {
-                            'first_name': '',
-                            'last_name': '',
-                            'company_name': '',
-                            'profile_url': item
-                        }
-                        self.profile_queue.put(profile_data)
-                        count += 1
-                
-                logger.info(f"Loaded {count} profiles from list")
-                
+                            self.profiles_list.append(profile_data)
+                            if len(self.profiles_list) <= 3:
+                                logger.info(f"Added URL: {url}")
+                    
+                    logger.info(f"Total lines processed: {line_count}")
+                    logger.info(f"Valid URLs found: {len(self.profiles_list)}")
+            
+            # Initialize database state manager if not exists
+            if not hasattr(self, 'db_state'):
+                self.db_state = DatabaseStateManager()
+            
+            # Get last processed index from database
+            start_index = self.db_state.get_last_processed_index()
+            
+            logger.info(f"Total profiles loaded: {len(self.profiles_list)}")
+            logger.info(f"Resuming from index: {start_index}")
+            
+            # Add only unprocessed profiles to queue
+            added_count = 0
+            skipped_count = 0
+            for i in range(start_index, len(self.profiles_list)):
+                profile = self.profiles_list[i]
+                # Check if already processed
+                if not self.db_state.is_processed(profile['profile_url']):
+                    self.profile_queue.put((i, profile))
+                    added_count += 1
+                else:
+                    skipped_count += 1
+            
+            logger.info(f"Added {added_count} unprocessed profiles to queue")
+            logger.info(f"Skipped {skipped_count} already processed profiles")
+            
+            # Show progress summary
+            processed_count = len([p for p in self.profiles_list if self.db_state.is_processed(p['profile_url'])])
+            logger.info(f"Progress: {processed_count}/{len(self.profiles_list)} profiles already processed")
+            
         except Exception as e:
             logger.error(f"Error loading profile URLs: {e}")
-    
+            import traceback
+            traceback.print_exc()
+  
     def start_scraping(self):
         """Start the scraping process with multiple workers"""
         if self.running:
@@ -2465,6 +2595,7 @@ class LinkedInProfileScraper:
                 return
                 
             last_profile_time = time.time()
+            consecutive_failures = 0
 
             while self.running:
                 try:
@@ -2479,6 +2610,17 @@ class LinkedInProfileScraper:
                             worker.in_cooldown = False
                             logger.info(f"Worker {worker.worker_id}: Cooldown expired")
                     
+                    # Check if we need to reinitialize session
+                    session_count = worker.db_state.get_session_count(worker.session_id)
+                    if session_count >= worker.max_profiles_per_session:
+                        logger.info(f"Worker {worker.worker_id}: Session limit reached, reinitializing")
+                        loop.run_until_complete(worker.cleanup())
+                        time.sleep(random.uniform(1800, 3600))  # 30-60 minute break
+                        init_success = loop.run_until_complete(worker.initialize())
+                        if not init_success:
+                            break
+                        continue
+
                     # Check for session timeout
                     if time.time() - last_profile_time > 1800:  # 30 minutes
                         logger.info(f"Worker {worker.worker_id}: Refreshing session due to inactivity")
@@ -2487,40 +2629,42 @@ class LinkedInProfileScraper:
                     
                     # Get next profile URL
                     try:
-                        profile_data_dict = self.profile_queue.get(timeout=5)
+                        index, profile_data = self.profile_queue.get(timeout=5)
                         last_profile_time = time.time()
+                        self.db_state.update_progress(index)
+
                     except queue.Empty:
                         logger.debug(f"Worker {worker.worker_id}: Queue empty, waiting...")
                         time.sleep(10)
                         continue
                     
                     # Extract profile URL and name for logging
-                    if isinstance(profile_data_dict, dict):
-                        profile_url = profile_data_dict.get('profile_url', '')
-                        profile_name = f"{profile_data_dict.get('first_name', '')} {profile_data_dict.get('last_name', '')}".strip()
-                        company_name = profile_data_dict.get('company_name', '')
-                        display_name = f"{profile_name} ({company_name})" if profile_name and company_name else profile_url
-                    else:
+                    # if isinstance(profile_data_dict, dict):
+                    profile_url = profile_data.get('profile_url', '')
+                    profile_name = f"{profile_data.get('first_name', '')} {profile_data.get('last_name', '')}".strip()
+                    company_name = profile_data.get('company_name', '')
+                    display_name = f"{profile_name} ({company_name})" if profile_name and company_name else profile_url
+                    # else:
                         # Handle old format (just URL string)
-                        profile_url = profile_data_dict
-                        display_name = profile_url
-                        # Convert to new format
-                        profile_data_dict = {
-                            'first_name': '',
-                            'last_name': '',
-                            'company_name': '',
-                            'profile_url': profile_url
-                        }
+                    # profile_url = profile_data_dict
+                    # display_name = profile_url
+                    # # Convert to new format
+                    # profile_data_dict = {
+                    #     'first_name': '',
+                    #     'last_name': '',
+                    #     'company_name': '',
+                    #     'profile_url': profile_url
+                    # }
                     
                     # Process the profile
-                    logger.info(f"Worker {worker.worker_id}: Processing {display_name}")
-                    scraped_data = loop.run_until_complete(worker.scrape_profile(profile_data_dict))
+                    logger.info(f"Worker {worker.worker_id}: Processing profile {index + 1}/{len(self.profiles_list)}: {display_name}")
+                    scraped_data = loop.run_until_complete(worker.scrape_profile(profile_data))
                     
                     # Put result in results queue
                     self.results_queue.put({
-                        'url': profile_data_dict.get('profile_url', ''),
-                        'name': f"{profile_data_dict.get('first_name', '')} {profile_data_dict.get('last_name', '')}".strip(),
-                        'company': profile_data_dict.get('company_name', ''),
+                        'url': profile_data.get('profile_url', ''),
+                        'name': f"{profile_data.get('first_name', '')} {profile_data.get('last_name', '')}".strip(),
+                        'company': profile_data.get('company_name', ''),
                         'success': scraped_data is not None,
                         'data': scraped_data,
                         'worker_id': worker.worker_id,
@@ -2530,14 +2674,24 @@ class LinkedInProfileScraper:
                     self.profile_queue.task_done()
                     # If scraping failed (likely due to blocks), increase delay
                     if scraped_data is None:
-                        delay = random.uniform(300, 600)  # 5-10 minutes if failed
-                        logger.warning(f"Worker {worker.worker_id}: Profile failed, extended wait of {delay:.1f}s")
+                        consecutive_failures += 1
+                        if consecutive_failures >= 3:
+                            delay = random.uniform(600, 1200)  # 10-20 minutes after multiple failures
+                            logger.warning(f"Worker {worker.worker_id}: Multiple failures, extended wait of {delay/60:.1f} minutes")
+                            consecutive_failures = 0
+                        else:
+                            delay = random.uniform(300, 600)
                     else:
-                        # Normal delay for successful scrapes
-                        delay = random.uniform(
-                            self.config.get('min_delay', 120),
-                            self.config.get('max_delay', 300)
-                        )
+                        consecutive_failures = 0
+                        # Smart delay based on time of day
+                        hour = datetime.now().hour
+                        if 9 <= hour <= 17:  # Business hours
+                            delay = random.uniform(120, 240)  # 2-4 minutes
+                        elif 17 < hour <= 22:  # Evening
+                            delay = random.uniform(180, 300)  # 3-5 minutes  
+                        else:  # Night/early morning
+                            delay = random.uniform(300, 600)  # 5-10 minutes
+                    
                     logger.info(f"Worker {worker.worker_id}: Waiting {delay:.1f}s before next profile")
                     time.sleep(delay)
                     
@@ -2555,6 +2709,43 @@ class LinkedInProfileScraper:
             with self.lock:
                 self.active_workers -= 1
     
+    def show_progress(self):
+        """Display current scraping progress"""
+        try:
+            total = len(self.profiles_list)
+            if total == 0:
+                logger.info("No profiles loaded")
+                return
+            
+            processed = 0
+            for profile in self.profiles_list:
+                if self.db_state.is_processed(profile['profile_url']):
+                    processed += 1
+            
+            remaining = total - processed
+            percentage = (processed / total * 100) if total > 0 else 0
+            
+            logger.info(f"\n{'='*50}")
+            logger.info(f"SCRAPING PROGRESS REPORT")
+            logger.info(f"{'='*50}")
+            logger.info(f"Total profiles: {total}")
+            logger.info(f"Processed: {processed} ({percentage:.1f}%)")
+            logger.info(f"Remaining: {remaining}")
+            logger.info(f"Active workers: {self.active_workers}")
+            logger.info(f"Queue size: {self.profile_queue.qsize()}")
+            
+            # Show daily stats for each worker
+            logger.info(f"\nToday's statistics by worker:")
+            for i in range(self.config.get('worker_count', 1)):
+                daily_count = self.db_state.get_daily_count(i)
+                session_limit, daily_limit = self.db_state.get_worker_limits(i)
+                logger.info(f"  Worker {i}: {daily_count}/{daily_limit} profiles today")
+            
+            logger.info(f"{'='*50}\n")
+            
+        except Exception as e:
+            logger.error(f"Error showing progress: {e}")
+
     def _result_processor(self):
         """Process and store results from workers"""
         while self.running or not self.results_queue.empty():
@@ -2598,32 +2789,6 @@ class LinkedInProfileScraper:
             except Exception as e:
                 logger.error(f"Error in progress monitor: {e}")
                 time.sleep(60)
-    
-    # def _save_progress_stats(self):
-    #     """Save progress statistics"""
-    #     try:
-    #         stats = {
-    #             'timestamp': datetime.now().isoformat(),
-    #             'total_processed': self.processed_profiles,
-    #             'successful': self.successful_profiles,
-    #             'remaining': self.profile_queue.qsize(),
-    #             'active_workers': self.active_workers,
-    #             'worker_stats': [
-    #                 {
-    #                     'worker_id': worker.worker_id,
-    #                     'profiles_scraped': worker.profiles_scraped,
-    #                     'in_cooldown': worker.in_cooldown,
-    #                     'cooldown_until': worker.cooldown_until.isoformat() if worker.cooldown_until else None
-    #                 }
-    #                 for worker in self.worker_pool
-    #             ]
-    #         }
-            
-    #         with open(f"linkedin_data/scraping_stats_{datetime.now().strftime('%Y%m%d')}.json", 'w') as f:
-    #             json.dump(stats, f, indent=2)
-                
-    #     except Exception as e:
-    #         logger.error(f"Error saving progress stats: {e}")
     
     def _signal_handler(self, sig, frame):
         """Handle termination signals"""
@@ -2675,16 +2840,17 @@ class LinkedInProfileScraper:
 def main():
 
     """Main function to run the mass profile scraper"""
-    parser = argparse.ArgumentParser(description='LinkedIn Mass Profile Scraper (Playwright version)')
+    parser = argparse.ArgumentParser(description='LinkedIn Mass Profile Scraper (Database-enhanced)')
     
-    parser.add_argument('--profile-file', type=str, help='File containing LinkedIn profile URLs')
-    parser.add_argument('--workers', type=int, default=3, help='Number of worker threads')
+    parser.add_argument('--profile-file', type=str, help='CSV file containing LinkedIn profile URLs')
+    parser.add_argument('--workers', type=int, default=1, help='Number of worker threads')
     parser.add_argument('--credentials-file', type=str, required=True, help='JSON file with LinkedIn credentials')
     parser.add_argument('--proxy-file', type=str, help='File containing proxy list')
     parser.add_argument('--headless', action='store_true', help='Run in headless mode')
-    parser.add_argument('--min-delay', type=int, default=30, help='Minimum delay between profiles in seconds')
-    parser.add_argument('--max-delay', type=int, default=90, help='Maximum delay between profiles in seconds')
+    parser.add_argument('--show-progress', action='store_true', help='Show progress and exit')
+    parser.add_argument('--reset-progress', action='store_true', help='Reset progress and start from beginning')
     
+
     args = parser.parse_args()
     # Load credentials from file
     try:
@@ -2701,14 +2867,20 @@ def main():
         'proxy_file': args.proxy_file,
         # 'headless': args.headless,
         'headless': False,
-        'min_delay': 120,
-        'max_delay': 300,
         'profile_file': args.profile_file
     }
     
     # Initialize the scraper
     scraper = LinkedInProfileScraper(config)
     
+    # Handle special commands
+    if args.reset_progress:
+        # Reset progress in database
+        db_state = DatabaseStateManager()
+        db_state.update_progress(0)
+        logger.info("Progress reset. Will start from beginning.")
+        return
+
     # Load profile URLs
     if args.profile_file:
         scraper.load_profile_urls(args.profile_file)
@@ -2716,6 +2888,26 @@ def main():
         logger.error("No profile source provided. Use --profile-file")
         return
     
+    # Show progress and exit if requested
+    if args.show_progress:
+        scraper.show_progress()
+        return
+
+    # Start progress monitor in a separate thread
+    def progress_monitor():
+        while scraper.running:
+            time.sleep(300)  # Show progress every 5 minutes
+            scraper.show_progress()
+
+    monitor_thread = threading.Thread(target=progress_monitor, daemon=True)
+    monitor_thread.start()
+    
+    # Start scraping
+    logger.info("Starting LinkedIn scraper with database state management")
+    logger.info(f"Session limits: 15-25 profiles per session (randomized)")
+    logger.info(f"Daily limits: 50-80 profiles per day (randomized)")
+    logger.info("The scraper will automatically resume from where it left off")
+   
     # Start scraping
     scraper.start_scraping()
 
